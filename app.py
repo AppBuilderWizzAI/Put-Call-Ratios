@@ -19,75 +19,95 @@ mit der Spekulation von Kleinanlegern (**Dumb Money** im CBOE Equity Markt).
 """)
 
 
-def parse_cboe_csv(url):
+def fetch_cboe_url(url):
+  """Ruft CBOE-Daten mit vollständigen Browser-Headern und Fallback auf cloudscraper ab."""
   headers = {
       "User-Agent": (
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML,"
-          " like Gecko) Chrome/120.0.0.0 Safari/537.36"
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+          " (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
       ),
       "Accept": (
-          "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8"
+          "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
       ),
+      "Accept-Language": "en-US,en;q=0.9,de;q=0.8",
+      "Referer": "https://www.cboe.com/",
+      "Sec-Ch-Ua": (
+          '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"'
+      ),
+      "Sec-Ch-Ua-Mobile": "?0",
+      "Sec-Ch-Ua-Platform": '"Windows"',
+      "Sec-Fetch-Dest": "document",
+      "Sec-Fetch-Mode": "navigate",
+      "Sec-Fetch-Site": "cross-site",
+      "Sec-Fetch-User": "?1",
+      "Upgrade-Insecure-Requests": "1",
   }
-  res = requests.get(url, headers=headers, timeout=15)
-  res.raise_for_status()
 
-  # Prüfen, ob CBOE ein HTML-Dokument (z. B. Blockade oder 404) zurückgegeben hat
-  if "<html" in res.text.lower() or "<doctype" in res.text.lower():
-    raise ValueError(
-        "CBOE hat eine HTML-Seite anstelle einer CSV-Datei zurückgegeben."
-        " Möglicherweise blockiert CBOE die Anfrage."
+  # Versuche cloudscraper zu nutzen, falls installiert (umgeht Cloudflare)
+  try:
+    import cloudscraper
+
+    scraper = cloudscraper.create_scraper()
+    res = scraper.get(url, headers=headers, timeout=15)
+  except ImportError:
+    # Fallback auf standardmäßigem requests.Session()
+    session = requests.Session()
+    res = session.get(url, headers=headers, timeout=15)
+
+  if res.status_code == 403:
+    raise PermissionError(
+        "CBOE blockiert Anfragen von Cloud-Servern (HTTP 403 / Cloudflare"
+        " Bot-Schutz)."
     )
 
-  lines = res.text.splitlines()
+  res.raise_for_status()
+  return res.text
 
-  # 1. Versuche, die Kopfzeile über das Wort 'date' zu finden
+
+def parse_cboe_csv(url):
+  raw_text = fetch_cboe_url(url)
+
+  if "<html" in raw_text.lower() or "<doctype" in raw_text.lower():
+    raise ValueError(
+        "CBOE hat eine HTML-Sperrseite anstelle einer CSV-Datei zurückgegeben."
+    )
+
+  lines = raw_text.splitlines()
+
+  # Suche nach Kopfzeile 'date'
   header_idx = -1
   for i, line in enumerate(lines):
     if "date" in line.lower():
       header_idx = i
       break
 
-  # 2. Fallback: Suche nach der ersten Zeile, die wie ein Datum aussieht (z.B. MM/DD/YYYY)
+  # Fallback: Suche nach Datumsmuster MM/DD/YYYY
   if header_idx == -1:
     date_pattern = re.compile(r"\b\d{1,2}/\d{1,2}/\d{2,4}\b")
     for i, line in enumerate(lines):
       if date_pattern.search(line):
-        # Nimm an, dass die Zeile vor den ersten Daten die Kopfzeile ist (oder erstelle künstlich eine)
         header_idx = max(0, i - 1)
         break
 
   if header_idx == -1:
-    raise ValueError("Keine Datums-Kopfzeile oder Datumsstruktur in der CBOE-Datei gefunden.")
+    raise ValueError("Keine Datums-Kopfzeile in der CBOE-Datei gefunden.")
 
-  # Lese CSV ab der gefundenen Zeile ein
   csv_data = "\n".join(lines[header_idx:])
   try:
     df = pd.read_csv(StringIO(csv_data), on_bad_lines="skip")
   except Exception:
-    # Falls das Einlesen mit Header fehlschlägt, versuche es ohne Header
     df = pd.read_csv(StringIO(csv_data), header=None, on_bad_lines="skip")
 
-  # Spaltennamen säubern
   df.columns = [str(c).strip().upper() for c in df.columns]
 
-  # Finde die Datumsspalte (Suche nach 'DATE', sonst erste Spalte verwenden)
   date_cols = [c for c in df.columns if "DATE" in c]
-  if date_cols:
-    date_col = date_cols[0]
-  else:
-    date_col = df.columns[0]
+  date_col = date_cols[0] if date_cols else df.columns[0]
 
   df["DATE"] = pd.to_datetime(df[date_col], errors="coerce")
   df = df.dropna(subset=["DATE"])
 
-  # Finde die P/C-Spalte (Suche nach P/C, RATIO, oder nimm die letzte Spalte)
   pc_cols = [c for c in df.columns if "P/C" in c or "RATIO" in c]
-  if pc_cols:
-    pc_col = pc_cols[0]
-  else:
-    # Oft ist die Ratio-Spalte die letzte Spalte in CBOE CSVs
-    pc_col = df.columns[-1]
+  pc_col = pc_cols[0] if pc_cols else df.columns[-1]
 
   df["PC_RATIO"] = pd.to_numeric(df[pc_col], errors="coerce")
   df = df.dropna(subset=["PC_RATIO"])
@@ -104,26 +124,16 @@ def load_and_process_ratios():
     df_eq = parse_cboe_csv(equity_url)
     df_oex = parse_cboe_csv(oex_url)
 
-    # Merge der beiden Datensätze über das Datum
     df = pd.merge(
         df_oex, df_eq, on="DATE", suffixes=("_OEX", "_EQUITY")
     )
-
     df = df.sort_values("DATE").reset_index(drop=True)
 
-    # 1. OEX Put/Call Ratio
     df["OEX_PC"] = df["PC_RATIO_OEX"]
-
-    # 2. Equity Put/Call Ratio
     df["EQUITY_PC"] = df["PC_RATIO_EQUITY"]
-
-    # 3. Equity Call/Put Ratio = 1 / Equity Put/Call Ratio
     df["EQUITY_CP"] = 1.0 / df["EQUITY_PC"]
-
-    # 4. Exakte Formel: (OEX P/C) - (Equity C/P)
     df["SPREAD"] = df["OEX_PC"] - df["EQUITY_CP"]
 
-    # Gleitende Durchschnitte
     df["SPREAD_SMA10"] = df["SPREAD"].rolling(window=10).mean()
     df["SPREAD_SMA21"] = df["SPREAD"].rolling(window=21).mean()
 
@@ -134,7 +144,7 @@ def load_and_process_ratios():
     return pd.DataFrame()
 
 
-with st.spinner("Lade echte CBOE-Daten..."):
+with st.spinner("Lade CBOE-Daten..."):
   df = load_and_process_ratios()
 
 if not df.empty:
@@ -146,14 +156,12 @@ if not df.empty:
   df_filtered = df.tail(days)
   latest = df.iloc[-1]
 
-  # Kennzahlen
   col1, col2, col3, col4 = st.columns(4)
   col1.metric("Datum", latest["DATE"].strftime("%Y-%m-%d"))
   col2.metric("OEX Put/Call (Smart)", f"{latest['OEX_PC']:.2f}")
   col3.metric("Equity Call/Put (Dumb)", f"{latest['EQUITY_CP']:.2f}")
   col4.metric("Spread (Smart - Dumb)", f"{latest['SPREAD']:.2f}")
 
-  # Charts
   fig = make_subplots(
       rows=2,
       cols=1,
@@ -165,7 +173,6 @@ if not df.empty:
       ),
   )
 
-  # Upper Plot
   fig.add_trace(
       plt.Scatter(
           x=df_filtered["DATE"],
@@ -197,7 +204,6 @@ if not df.empty:
       col=1,
   )
 
-  # Lower Plot
   fig.add_trace(
       plt.Scatter(
           x=df_filtered["DATE"],
