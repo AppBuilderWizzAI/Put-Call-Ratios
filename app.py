@@ -1,216 +1,104 @@
-from io import StringIO
+import io
 import pandas as pd
-import plotly.graph_objects as plt
-from plotly.subplots import make_subplots
 import requests
 import streamlit as st
 
-# --- SEITEN-KONFIGURATION ---
 st.set_page_config(
-    page_title="Smart Money vs. Dumb Money Put/Call Ratio (FRED)",
-    layout="wide",
+    page_title="Smart Money vs. Dumb Money Indicator", layout="wide"
 )
 
 st.title("Smart Money vs. Dumb Money Indicator")
+
 st.markdown("""
-Dieser Indikator vergleicht das Absicherungsverhalten von Großanlegern (**Smart Money** im Index-Markt) 
-mit der Spekulation von Kleinanlegern (**Dumb Money** im Einzelaktien-Markt) über Daten der **Federal Reserve Bank of St. Louis (FRED)**.
+Dieser Indikator vergleicht das Absicherungsverhalten von Großanlegern (**Smart Money** im Index-Markt) mit der Spekulation von Kleinanlegern (**Dumb Money** im Einzelaktien-Markt) über Daten der Federal Reserve Bank of St. Louis (FRED).
 
 * **Smart Money:** CBOE Index Put/Call Ratio (`PCINDEX`)
-* **Dumb Money:** CBOE Equity Call/Put Ratio ($1 / \text{Equity P/C}$ via `PCEQUITY`)
-* **Formel:** `(Index Put/Call Ratio) - (Equity Call/Put Ratio)`
+* **Dumb Money:** CBOE Equity Call/Put Ratio ($1 / \\text{PCEQUITY}$)
+* **Formel:** $\\text{Smart Money Indicator} = \\text{Index Put/Call Ratio} - \\text{Equity Call/Put Ratio}$
 """)
 
-# --- SIDEBAR EINSTELLUNGEN ---
+# Seitenleiste für Optionen & API-Key
 st.sidebar.header("Einstellungen")
-fred_api_key = st.sidebar.text_input(
-    "FRED API Key (Optional):",
+api_key = st.sidebar.text_input(
+    "FRED API-Key (optional, dringend empfohlen):",
     type="password",
-    help="Kostenlos auf fred.stlouisfed.org erstellen. Wenn leer, wird der direkte CSV-Download genutzt.",
+    help="Falls der Direkt-Download blockiert wird: Kostenlosen Key auf https://fred.stlouisfed.org/ erstellen und hier eintragen.",
 )
+days_to_show = st.sidebar.slider("Anzahl Tage anzeigen:", 30, 1000, 365)
 
-equity_series_id = st.sidebar.text_input(
-    "Equity P/C Series ID:",
-    value="PCEQUITY",
-    help="FRED Ticker für Equity Put/Call Ratio",
-)
-
-index_series_id = st.sidebar.text_input(
-    "Index P/C Series ID:",
-    value="PCINDEX",
-    help="FRED Ticker für Index Put/Call Ratio",
-)
-
-days = st.sidebar.slider(
-    "Zeitraum (Tage):", min_value=30, max_value=1000, value=252
-)
+# Browser-Header vortäuschen, um Timeout / Blockaden zu vermeiden
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML,"
+        " like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    )
+}
 
 
-# --- FRED DATEN LADEN ---
+@st.cache_data(ttl=3600)
 def fetch_fred_series(series_id, api_key=None):
-  """Lädt eine Zeitreihe von FRED per API-Key oder per direktem CSV-Download."""
-  headers = {
-      "User-Agent": (
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-          " (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-      )
-  }
+    # Methode 1: Offizielle FRED API (beste & stabilste Methode)
+    if api_key and api_key.strip():
+        url = f"https://api.stlouisfed.org/fred/series/observations?series_id={series_id}&api_key={api_key.strip()}&file_type=json"
+        res = requests.get(url, headers=HEADERS, timeout=25)
+        res.raise_for_status()
+        data = res.json()
+        obs = data.get("observations", [])
+        df = pd.DataFrame(obs)[["date", "value"]]
+        df["value"] = pd.to_numeric(df["value"], errors="coerce")
+        df["date"] = pd.to_datetime(df["date"])
+        df = df.dropna().set_index("date")
+        return df["value"]
 
-  if api_key:
-    # 1. Option: Offizielle FRED JSON API
-    url = f"https://api.stlouisfed.org/fred/series/observations?series_id={series_id}&api_key={api_key}&file_type=json"
-    res = requests.get(url, headers=headers, timeout=15)
-    res.raise_for_status()
-    data = res.json().get("observations", [])
-    df = pd.DataFrame(data)[["date", "value"]]
-    df.columns = ["DATE", "VALUE"]
-  else:
-    # 2. Option: Direkter CSV-Download von FRED
-    url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}"
-    res = requests.get(url, headers=headers, timeout=15)
-    res.raise_for_status()
-    df = pd.read_csv(StringIO(res.text))
-    df.columns = ["DATE", "VALUE"]
+    # Methode 2: Direkt-Download mit angepasst-stabilem Header & Timeout
+    else:
+        url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}"
+        res = requests.get(url, headers=HEADERS, timeout=25)
+        res.raise_for_status()
+        df = pd.read_csv(io.StringIO(res.text))
 
-  # Datenbereinigung
-  df["VALUE"] = pd.to_numeric(df["VALUE"], errors="coerce")
-  df["DATE"] = pd.to_datetime(df["DATE"], errors="coerce")
-  return df.dropna(subset=["DATE", "VALUE"])
+        df.columns = [c.strip() for c in df.columns]
+        date_col, val_col = df.columns[0], df.columns[1]
 
-
-@st.cache_data(ttl=14400)
-def load_market_data_from_fred(api_key, eq_id, idx_id):
-  df_eq = fetch_fred_series(eq_id, api_key)
-  df_idx = fetch_fred_series(idx_id, api_key)
-
-  if df_eq.empty or df_idx.empty:
-    raise ValueError(
-        "Es konnten keine Daten für eine oder beide FRED-Serien geladen werden."
-    )
-
-  df_eq.rename(columns={"VALUE": "EQUITY_PC"}, inplace=True)
-  df_idx.rename(columns={"VALUE": "INDEX_PC"}, inplace=True)
-
-  # Merge über das Datum
-  df = pd.merge(df_idx, df_eq, on="DATE", how="inner")
-  df = df.sort_values("DATE").reset_index(drop=True)
-
-  # Berechnungen
-  df["EQUITY_CP"] = 1.0 / df["EQUITY_PC"]  # Dumb Money Sentiment
-  df["SPREAD"] = df["INDEX_PC"] - df["EQUITY_CP"]  # Smart - Dumb Spread
-
-  df["SPREAD_SMA10"] = df["SPREAD"].rolling(window=10).mean()
-  df["SPREAD_SMA21"] = df["SPREAD"].rolling(window=21).mean()
-
-  return df
+        df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+        df[val_col] = pd.to_numeric(df[val_col], errors="coerce")
+        df = df.dropna(subset=[date_col, val_col]).set_index(date_col)
+        return df[val_col]
 
 
-# --- HAUPTLOGIK & ANZEIGE ---
+# Daten abrufen und anzeigen
 try:
-  with st.spinner("Lade Daten von FRED..."):
-    df = load_market_data_from_fred(
-        fred_api_key, equity_series_id, index_series_id
-    )
+    with st.spinner("Lade FRED-Daten..."):
+        pcindex = fetch_fred_series("PCINDEX", api_key)
+        pcequity = fetch_fred_series("PCEQUITY", api_key)
 
-  df_filtered = df.tail(days)
-  latest = df.iloc[-1]
+    df = pd.DataFrame({"PCINDEX": pcindex, "PCEQUITY": pcequity}).dropna()
 
-  # --- METRICS ANZEIGEN ---
-  col1, col2, col3, col4 = st.columns(4)
-  col1.metric("Datum", latest["DATE"].strftime("%Y-%m-%d"))
-  col2.metric("Index P/C (Smart)", f"{latest['INDEX_PC']:.2f}")
-  col3.metric("Equity C/P (Dumb)", f"{latest['EQUITY_CP']:.2f}")
-  col4.metric("Spread (Smart - Dumb)", f"{latest['SPREAD']:.2f}")
+    if df.empty:
+        st.warning("Keine Daten gefunden.")
+    else:
+        # Berechnung: Call/Put ist der Kehrwert der Put/Call Ratio
+        df["Equity_Call_Put"] = 1 / df["PCEQUITY"]
+        df["Indicator"] = df["PCINDEX"] - df["Equity_Call_Put"]
 
-  # --- CHARTS ERSTELLEN ---
-  fig = make_subplots(
-      rows=2,
-      cols=1,
-      shared_xaxes=True,
-      vertical_spacing=0.08,
-      subplot_titles=(
-          "Smart vs. Dumb Money Spread Index",
-          "Einzelkomponenten (Index P/C vs. Equity C/P)",
-      ),
-  )
+        df_display = df.tail(days_to_show)
 
-  # Subplot 1: Spread & SMAs
-  fig.add_trace(
-      plt.Scatter(
-          x=df_filtered["DATE"],
-          y=df_filtered["SPREAD"],
-          name="Spread (Täglich)",
-          line=dict(color="lightgray", width=1),
-      ),
-      row=1,
-      col=1,
-  )
-  fig.add_trace(
-      plt.Scatter(
-          x=df_filtered["DATE"],
-          y=df_filtered["SPREAD_SMA10"],
-          name="Spread (10-Tage SMA)",
-          line=dict(color="blue", width=2),
-      ),
-      row=1,
-      col=1,
-  )
-  fig.add_trace(
-      plt.Scatter(
-          x=df_filtered["DATE"],
-          y=df_filtered["SPREAD_SMA21"],
-          name="Spread (21-Tage SMA)",
-          line=dict(color="orange", width=2),
-      ),
-      row=1,
-      col=1,
-  )
+        st.subheader("Smart Money vs. Dumb Money Indikator")
+        st.line_chart(df_display[["Indicator", "PCINDEX", "Equity_Call_Put"]])
 
-  # Subplot 2: Ratios
-  fig.add_trace(
-      plt.Scatter(
-          x=df_filtered["DATE"],
-          y=df_filtered["INDEX_PC"],
-          name="Index P/C (Smart Money)",
-          line=dict(color="darkcyan", width=1.5),
-      ),
-      row=2,
-      col=1,
-  )
-  fig.add_trace(
-      plt.Scatter(
-          x=df_filtered["DATE"],
-          y=df_filtered["EQUITY_CP"],
-          name="Equity C/P (Dumb Money)",
-          line=dict(color="red", width=1.5),
-      ),
-      row=2,
-      col=1,
-  )
-
-  fig.update_layout(height=700, template="plotly_white", hovermode="x unified")
-  fig.update_yaxes(title_text="Spread Index", row=1, col=1)
-  fig.update_yaxes(title_text="Ratio", row=2, col=1)
-
-  st.plotly_chart(fig, use_container_width=True)
-
-  # --- ROHDATEN ---
-  with st.expander("Rohdaten anzeigen"):
-    st.dataframe(
-        df_filtered[[
-            "DATE",
-            "INDEX_PC",
-            "EQUITY_PC",
-            "EQUITY_CP",
-            "SPREAD",
-            "SPREAD_SMA10",
-        ]].sort_values("DATE", ascending=False)
-    )
+        st.subheader("Aktuelle Werte")
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Indikator-Wert", f"{df_display['Indicator'].iloc[-1]:.2f}")
+        c2.metric("Smart Money (PCINDEX)", f"{df_display['PCINDEX'].iloc[-1]:.2f}")
+        c3.metric(
+            "Dumb Money (1/PCEQUITY)", f"{df_display['Equity_Call_Put'].iloc[-1]:.2f}"
+        )
 
 except Exception as e:
-  st.error(f"Fehler beim Laden der FRED-Daten: {e}")
-  st.info(
-      "Hinweis: Falls die Standard-IDs keine Daten liefern, erstelle einen"
-      " kostenlosen API-Key auf https://fred.stlouisfed.org/ und trage ihn in"
-      " der Seitenleiste ein."
-  )
+    st.error(f"Fehler beim Laden der Daten: {e}")
+    st.info("""
+    **Tipp:** Falls Streamlit Cloud den Direktzugriff weiterhin drosselt:
+    1. Registriere dich kostenlos auf [fred.stlouisfed.org](https://fred.stlouisfed.org/docs/api/api_key.html).
+    2. Erstelle unter *My Account -> API Keys* einen Key.
+    3. Trage diesen Key in der Seitenleiste der App ein.
+    """)
