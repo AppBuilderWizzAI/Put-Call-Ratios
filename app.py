@@ -3,6 +3,7 @@ import pandas as pd
 import plotly.graph_objects as plt
 from plotly.subplots import make_subplots
 import requests
+from io import StringIO
 
 st.set_page_config(
     page_title="Smart Money vs. Dumb Money Put/Call Ratio",
@@ -17,66 +18,75 @@ mit der Spekulation von Kleinanlegern (**Dumb Money** im CBOE Equity Markt).
 **Formel:** `(OEX Put/Call Ratio) - (Equity Call/Put Ratio)`
 """)
 
-@st.cache_data(ttl=14400)
-def fetch_cboe_data(url):
+def parse_cboe_csv(url):
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
     }
     res = requests.get(url, headers=headers, timeout=15)
+    lines = res.text.splitlines()
     
-    # Filtere Metadaten-Zeilen aus CBOE-Dateien
-    lines = [line for line in res.text.splitlines() if line and not line.startswith('#') and 'CBOE' not in line]
+    # Suche die Zeile, in der die Spaltenüberschrift 'Date' vorkommt
+    header_idx = -1
+    for i, line in enumerate(lines):
+        if 'date' in line.lower():
+            header_idx = i
+            break
+            
+    if header_idx == -1:
+        raise ValueError("Keine Datums-Kopfzeile in der CBOE-Datei gefunden.")
+        
+    # Lese CSV ab der gefundenen Kopfzeile
+    csv_data = "\n".join(lines[header_idx:])
+    df = pd.read_csv(StringIO(csv_data))
     
-    # In DataFrame umwandeln
-    from io import StringIO
-    df = pd.read_csv(StringIO('\n'.join(lines)))
-    return df
+    # Spaltennamen säubern
+    df.columns = [str(c).strip().upper() for c in df.columns]
+    
+    # Finde die Datumsspalte (egal ob DATE, Date etc.)
+    date_col = [c for c in df.columns if 'DATE' in c][0]
+    df['DATE'] = pd.to_datetime(df[date_col], errors='coerce')
+    df = df.dropna(subset=['DATE'])
+    
+    # Finde die P/C-Spalte (z. B. P/C, P/C RATIO, RATIO)
+    pc_cols = [c for c in df.columns if 'P/C' in c or 'RATIO' in c]
+    if not pc_cols:
+        raise ValueError("Keine P/C Ratio Spalte gefunden.")
+    
+    pc_col = pc_cols[0]
+    df['PC_RATIO'] = pd.to_numeric(df[pc_col], errors='coerce')
+    df = df.dropna(subset=['PC_RATIO'])
+    
+    return df[['DATE', 'PC_RATIO']]
 
 @st.cache_data(ttl=14400)
 def load_and_process_ratios():
     try:
-        # Offizielle CBOE Endpunkte
         equity_url = "https://cdn.cboe.com/resources/options/volume_and_call_put_ratios/equitypc.csv"
         oex_url = "https://cdn.cboe.com/resources/options/volume_and_call_put_ratios/oexpc.csv"
         
-        df_eq = fetch_cboe_data(equity_url)
-        df_oex = fetch_cboe_data(oex_url)
+        df_eq = parse_cboe_csv(equity_url)
+        df_oex = parse_cboe_csv(oex_url)
         
-        # Spaltennamen bereinigen
-        df_eq.columns = [c.strip().upper() for c in df_eq.columns]
-        df_oex.columns = [c.strip().upper() for c in df_oex.columns]
-        
-        # Datum parsen
-        df_eq['DATE'] = pd.to_datetime(df_eq['DATE'], errors='coerce')
-        df_oex['DATE'] = pd.to_datetime(df_oex['DATE'], errors='coerce')
-        
-        df_eq = df_eq.dropna(subset=['DATE'])
-        df_oex = df_oex.dropna(subset=['DATE'])
-        
-        # Spalte 'P/C' oder 'P/C RATIO' identifizieren
-        pc_col_eq = [c for c in df_eq.columns if 'P/C' in c or 'RATIO' in c][0]
-        pc_col_oex = [c for c in df_oex.columns if 'P/C' in c or 'RATIO' in c][0]
-        
-        # Merge der beiden Datensätze
+        # Merge der beiden Datensätze über das Datum
         df = pd.merge(
-            df_oex[['DATE', pc_col_oex]], 
-            df_eq[['DATE', pc_col_eq]], 
+            df_oex, 
+            df_eq, 
             on='DATE', 
             suffixes=('_OEX', '_EQUITY')
         )
         
-        df['OEX_PC'] = pd.to_numeric(df[pc_col_oex + '_OEX'], errors='coerce')
-        df['EQUITY_PC'] = pd.to_numeric(df[pc_col_eq + '_EQUITY'], errors='coerce')
-        
-        df = df.dropna(subset=['OEX_PC', 'EQUITY_PC'])
         df = df.sort_values('DATE').reset_index(drop=True)
         
-        # Berechnungen nach deiner Formel:
-        # Equity C/P = 1 / Equity P/C
+        # 1. OEX Put/Call Ratio
+        df['OEX_PC'] = df['PC_RATIO_OEX']
+        
+        # 2. Equity Put/Call Ratio
+        df['EQUITY_PC'] = df['PC_RATIO_EQUITY']
+        
+        # 3. Equity Call/Put Ratio = 1 / Equity Put/Call Ratio
         df['EQUITY_CP'] = 1.0 / df['EQUITY_PC']
         
-        # Spread = (OEX P/C) - (Equity C/P)
+        # 4. Exakte Formel: (OEX P/C) - (Equity C/P)
         df['SPREAD'] = df['OEX_PC'] - df['EQUITY_CP']
         
         # Gleitende Durchschnitte
@@ -89,7 +99,7 @@ def load_and_process_ratios():
         st.error(f"Fehler beim Laden der CBOE-Daten: {e}")
         return pd.DataFrame()
 
-with st.spinner("Lade CBOE-Daten..."):
+with st.spinner("Lade echte CBOE-Daten..."):
     df = load_and_process_ratios()
 
 if not df.empty:
@@ -99,14 +109,14 @@ if not df.empty:
     df_filtered = df.tail(days)
     latest = df.iloc[-1]
     
-    # Kennzahlen anzeigen
+    # Kennzahlen
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("Datum", latest['DATE'].strftime('%Y-%m-%d'))
     col2.metric("OEX Put/Call (Smart)", f"{latest['OEX_PC']:.2f}")
     col3.metric("Equity Call/Put (Dumb)", f"{latest['EQUITY_CP']:.2f}")
     col4.metric("Spread (Smart - Dumb)", f"{latest['SPREAD']:.2f}")
 
-    # Charts erstellen
+    # Charts
     fig = make_subplots(
         rows=2, cols=1, 
         shared_xaxes=True, 
@@ -114,7 +124,7 @@ if not df.empty:
         subplot_titles=("Smart vs. Dumb Money Spread", "Einzelkomponenten (OEX P/C vs. Equity C/P)")
     )
 
-    # Upper chart: Spread
+    # Upper Plot
     fig.add_trace(
         plt.Scatter(x=df_filtered['DATE'], y=df_filtered['SPREAD'], name="Spread (Täglich)", line=dict(color='lightgray', width=1)),
         row=1, col=1
@@ -128,7 +138,7 @@ if not df.empty:
         row=1, col=1
     )
 
-    # Lower chart: Individual components
+    # Lower Plot
     fig.add_trace(
         plt.Scatter(x=df_filtered['DATE'], y=df_filtered['OEX_PC'], name="OEX P/C (Smart Money)", line=dict(color='green', width=1.5)),
         row=2, col=1
