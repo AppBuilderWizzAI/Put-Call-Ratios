@@ -1,136 +1,203 @@
-import io
 import pandas as pd
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import requests
 import streamlit as st
 
+# --- SEITEN-KONFIGURATION ---
 st.set_page_config(
-    page_title="Smart Money vs. Dumb Money Indicator",
-    page_icon="📈",
-    layout="wide",
+    page_title="Smart & Dumb Money Put/Call Ratio", page_icon="📈", layout="wide"
 )
 
-st.title("Smart Money vs. Dumb Money Indicator")
+st.title("Smart & Dumb Money Put/Call Ratio Dashboard")
 
 st.markdown("""
-Dieser Indikator vergleicht das Absicherungsverhalten von Großanlegern (**Smart Money** im Index-Markt) mit der Spekulation von Kleinanlegern (**Dumb Money** im Einzelaktien-Markt) über Daten der Federal Reserve Bank of St. Louis (FRED).
+Dieses Dashboard vergleicht das Absicherungsverhalten professioneller Akteure (**Smart Money** im Index-Markt) 
+mit der Spekulation von Kleinanlegern (**Dumb Money** im Einzelaktien-Markt).
 
-* **Smart Money:** CBOE Index Put/Call Ratio (`PCINDEX`)
-* **Dumb Money:** CBOE Equity Call/Put Ratio ($1 / \\text{PCEQUITY}$)
-* **Formel:** $\\text{Smart Money Indicator} = \\text{Index Put/Call Ratio} - \\text{Equity Call/Put Ratio}$
+* **Smart Money:** CBOE Index Put/Call Ratio (`INDEX_PC`)
+* **Dumb Money:** CBOE Equity Call/Put Ratio ($1 / \\text{EQUITY\\_PC}$)
+* **Spread / Indikator:** $\\text{Index P/C} - \\left(\\frac{1}{\\text{Equity P/C}}\\right)$
 """)
 
+# --- SIDEBAR EINSTELLUNGEN ---
 st.sidebar.header("⚙️ Einstellungen")
 
-# Key automatisch aus Streamlit Secrets laden (falls hinterlegt)
-secret_key = st.secrets.get("FRED_API_KEY", "")
-
-# Formular für Mobilgeräte (verhindert unvollständige Eingaben)
-with st.sidebar.form(key="fred_form"):
-  api_key_input = st.text_input(
-      "FRED API-Key:",
-      value=secret_key,
-      type="password",
-      help="Kostenlos erstellen auf https://fred.stlouisfed.org/docs/api/api_key.html",
-  )
-  days_to_show = st.slider("Anzahl Tage anzeigen:", 30, 1000, 365)
-  submit_button = st.form_submit_button(label="🔄 Daten laden")
-
-# Welcher Key soll genutzt werden?
-active_api_key = (
-    api_key_input.strip() if api_key_input.strip() else secret_key.strip()
+days = st.sidebar.slider(
+    "Zeitraum (Anzahl Tage):", min_value=30, max_value=1000, value=252
 )
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML,"
-        " like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    )
-}
+# Button zum manuellen Aktualisieren des Caches
+if st.sidebar.button("🔄 Live-Daten neu laden"):
+  st.cache_data.clear()
+  st.rerun()
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def fetch_via_api(series_id, key):
-  """Offizielle FRED JSON API (funktioniert zuverlässig mit Key)."""
-  url = f"https://api.stlouisfed.org/fred/series/observations?series_id={series_id}&api_key={key}&file_type=json"
-  res = requests.get(url, headers=HEADERS, timeout=15)
-  res.raise_for_status()
-  data = res.json()
-  obs = data.get("observations", [])
-  if not obs:
-    raise ValueError(f"Keine Daten für {series_id} erhalten.")
-  df = pd.DataFrame(obs)[["date", "value"]]
-  df["value"] = pd.to_numeric(df["value"], errors="coerce")
-  df["date"] = pd.to_datetime(df["date"])
-  return df.dropna().set_index("date")["value"]
+# --- VOLLAUTOMATISCHER DATEN-DOWNLOAD ---
+def fetch_yahoo_data(ticker: str, range_str: str = "2y") -> pd.DataFrame:
+  """Holt historische Daten direkt aus der Yahoo Finance Chart-Schnittstelle."""
+  url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?range={range_str}&interval=1d"
 
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def fetch_via_csv(series_id):
-  """Fallback-Direktdownload."""
-  url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}"
-  res = requests.get(url, headers=HEADERS, timeout=15)
-  res.raise_for_status()
-  df = pd.read_csv(io.StringIO(res.text))
-  df.columns = [c.strip() for c in df.columns]
-  date_col, val_col = df.columns[0], df.columns[1]
-  df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
-  df[val_col] = pd.to_numeric(df[val_col], errors="coerce")
-  return df.dropna(subset=[date_col, val_col]).set_index(date_col)[val_col]
-
-
-pcindex, pcequity, err_details = None, None, None
-
-# Abrufversuch 1: Über API-Key
-if active_api_key:
-  try:
-    with st.spinner("Lade Daten über FRED API..."):
-      pcindex = fetch_via_api("PCINDEX", active_api_key)
-      pcequity = fetch_via_api("PCEQUITY", active_api_key)
-  except Exception as e:
-    err_details = f"API-Fehler: {e}"
-
-# Abrufversuch 2: Ohne Key über Direkt-CSV (falls Versuch 1 fehlschlug oder kein Key da ist)
-if pcindex is None or pcequity is None:
-  try:
-    with st.spinner("Versuche Direkt-Download von FRED..."):
-      pcindex = fetch_via_csv("PCINDEX")
-      pcequity = fetch_via_csv("PCEQUITY")
-      err_details = None
-  except Exception as e:
-    if not err_details:
-      err_details = (
-          "Direkt-Download von Streamlit Cloud blockiert (Timeout). API-Key"
-          " erforderlich."
+  # Browser-Header vortäuschen, um Cloud-Sperren zu umgehen
+  headers = {
+      "User-Agent": (
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+          " (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
       )
+  }
 
-# Darstellung
-if pcindex is not None and pcequity is not None:
-  df = pd.DataFrame({"PCINDEX": pcindex, "PCEQUITY": pcequity}).dropna()
-
-  if not df.empty:
-    df["Equity_Call_Put"] = 1 / df["PCEQUITY"]
-    df["Indicator"] = df["PCINDEX"] - df["Equity_Call_Put"]
-
-    df_display = df.tail(days_to_show)
-
-    st.subheader("Smart Money vs. Dumb Money Indikator")
-    st.line_chart(df_display[["Indicator", "PCINDEX", "Equity_Call_Put"]])
-
-    st.subheader("Aktuelle Werte")
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Indikator-Wert", f"{df_display['Indicator'].iloc[-1]:.2f}")
-    c2.metric("Smart Money (PCINDEX)", f"{df_display['PCINDEX'].iloc[-1]:.2f}")
-    c3.metric(
-        "Dumb Money (1/PCEQUITY)", f"{df_display['Equity_Call_Put'].iloc[-1]:.2f}"
+  response = requests.get(url, headers=headers, timeout=10)
+  if response.status_code != 200:
+    raise RuntimeError(
+        f"Fehler beim Abrufen von {ticker} (HTTP {response.status_code})"
     )
-  else:
-    st.warning("Keine Daten im gewählten Zeitraum verfügbar.")
-else:
-  st.error("⚠️ Daten konnten nicht geladen werden.")
-  if err_details:
-    st.info(f"**Hinweis:** {err_details}")
-  st.warning(
-    "Bitte trage deinen FRED API-Key in den **Secrets** der Streamlit Cloud ein"
-    " oder gib ihn in der Seitenleiste ein und klicke auf **'🔄 Daten"
-    " laden'**."
+
+  data = response.json()
+  result = data["chart"]["result"][0]
+  timestamps = result["timestamp"]
+  closes = result["indicators"]["quote"][0]["close"]
+
+  df = pd.DataFrame({
+      "DATE": pd.to_datetime(timestamps, unit="s").dt.strftime("%Y-%m-%d"),
+      ticker: closes,
+  })
+  return df.dropna()
+
+
+# Cache für 1 Stunde (3600 Sekunden)
+@st.cache_data(ttl=3600)
+def load_live_data():
+  # Daten für Index (Smart Money) und Equity (Dumb Money) abrufen
+  df_cpci = fetch_yahoo_data("^CPCI", "2y")
+  df_cpce = fetch_yahoo_data("^CPCE", "2y")
+
+  # Zusammenführen über das Datum
+  df = pd.merge(df_cpci, df_cpce, on="DATE")
+  df.rename(
+      columns={"^CPCI": "INDEX_PC", "^CPCE": "EQUITY_PC"}, inplace=True
+  )
+
+  df["DATE"] = pd.to_datetime(df["DATE"])
+  df["INDEX_PC"] = pd.to_numeric(df["INDEX_PC"], errors="coerce")
+  df["EQUITY_PC"] = pd.to_numeric(df["EQUITY_PC"], errors="coerce")
+
+  df = df.dropna().sort_values("DATE")
+
+  # Berechnungen
+  df["EQUITY_CP"] = 1.0 / df["EQUITY_PC"]  # Dumb Money Call/Put Ratio
+  df["SPREAD"] = df["INDEX_PC"] - df["EQUITY_CP"]  # Smart - Dumb Spread
+
+  # Gleitende Durchschnitte
+  df["SPREAD_SMA10"] = df["SPREAD"].rolling(window=10).mean()
+  df["SPREAD_SMA21"] = df["SPREAD"].rolling(window=21).mean()
+
+  return df
+
+
+# --- HAUPTLOGIK & ANZEIGE ---
+try:
+  with st.spinner("Lade neuste Marktdaten von Yahoo Finance..."):
+    df = load_live_data()
+
+  df_filtered = df.tail(days)
+  latest = df.iloc[-1]
+
+  # --- KENNZAHLEN (METRICS) ---
+  col1, col2, col3, col4 = st.columns(4)
+  col1.metric("Datum", latest["DATE"].strftime("%Y-%m-%d"))
+  col2.metric("Index P/C (Smart)", f"{latest['INDEX_PC']:.2f}")
+  col3.metric("Equity C/P (Dumb)", f"{latest['EQUITY_CP']:.2f}")
+  col4.metric("Spread (Smart - Dumb)", f"{latest['SPREAD']:.2f}")
+
+  # --- CHARTS ERSTELLEN ---
+  fig = make_subplots(
+      rows=2,
+      cols=1,
+      shared_xaxes=True,
+      vertical_spacing=0.08,
+      subplot_titles=(
+          "Smart vs. Dumb Money Spread Index",
+          "Einzelkomponenten (Index P/C vs. Equity C/P)",
+      ),
+  )
+
+  # Subplot 1: Spread & SMAs
+  fig.add_trace(
+      go.Scatter(
+          x=df_filtered["DATE"],
+          y=df_filtered["SPREAD"],
+          name="Spread (Täglich)",
+          line=dict(color="lightgray", width=1),
+      ),
+      row=1,
+      col=1,
+  )
+  fig.add_trace(
+      go.Scatter(
+          x=df_filtered["DATE"],
+          y=df_filtered["SPREAD_SMA10"],
+          name="Spread (10-Tage SMA)",
+          line=dict(color="#1f77b4", width=2),
+      ),
+      row=1,
+      col=1,
+  )
+  fig.add_trace(
+      go.Scatter(
+          x=df_filtered["DATE"],
+          y=df_filtered["SPREAD_SMA21"],
+          name="Spread (21-Tage SMA)",
+          line=dict(color="#ff7f0e", width=2),
+      ),
+      row=1,
+      col=1,
+  )
+
+  # Subplot 2: Ratios
+  fig.add_trace(
+      go.Scatter(
+          x=df_filtered["DATE"],
+          y=df_filtered["INDEX_PC"],
+          name="Index P/C (Smart Money)",
+          line=dict(color="darkcyan", width=1.5),
+      ),
+      row=2,
+      col=1,
+  )
+  fig.add_trace(
+      go.Scatter(
+          x=df_filtered["DATE"],
+          y=df_filtered["EQUITY_CP"],
+          name="Equity C/P (Dumb Money)",
+          line=dict(color="crimson", width=1.5),
+      ),
+      row=2,
+      col=1,
+  )
+
+  fig.update_layout(height=700, template="plotly_white", hovermode="x unified")
+  fig.update_yaxes(title_text="Spread Index", row=1, col=1)
+  fig.update_yaxes(title_text="Ratio", row=2, col=1)
+
+  st.plotly_chart(fig, use_container_width=True)
+
+  # --- ROHDATEN TABELLE ---
+  with st.expander("📊 Live-Rohdaten anzeigen"):
+    st.dataframe(
+        df_filtered[[
+            "DATE",
+            "INDEX_PC",
+            "EQUITY_PC",
+            "EQUITY_CP",
+            "SPREAD",
+            "SPREAD_SMA10",
+        ]].sort_values("DATE", ascending=False),
+        use_container_width=True,
+    )
+
+except Exception as e:
+  st.error(f"❌ Fehler beim automatischen Abrufen der Live-Daten: {e}")
+  st.info(
+      "Klicke in der Seitenleiste auf 'Live-Daten neu laden' oder versuche es"
+      " in einigen Minuten erneut."
   )
