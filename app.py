@@ -1,225 +1,138 @@
 import streamlit as st
 import pandas as pd
-import yfinance as yf
-import plotly.graph_objects as go
+import plotly.graph_objects as plt
 from plotly.subplots import make_subplots
-from datetime import datetime, timedelta
+import requests
+import io
 
-# 1. PAGE CONFIGURATION
 st.set_page_config(
-    page_title="Options Put/Call Smart vs. Dumb Money Dashboard",
-    layout="wide",
-    page_icon="📈"
+    page_title="Smart Money vs. Dumb Money Put/Call Ratio",
+    layout="wide"
 )
 
-st.title("📊 Options Put/Call Ratio: Smart vs. Dumb Money Dashboard")
+st.title("Smart Money vs. Dumb Money Indicator")
+st.markdown("""
+Dieser Indikator vergleicht das Absicherungsverhalten von Großanlegern (**Smart Money** im S&P 100 / OEX) 
+mit der Spekulation von Kleinanlegern (**Dumb Money** im CBOE Equity Markt).
 
-# 2. SIDEBAR EINSTELLUNGEN
-with st.sidebar:
-    st.header("⚙️ Markt & Indikator Einstellungen")
-    
-    # Markt-Auswahl
-    market_options = {
-        "S&P 500": "^GSPC",
-        "Nasdaq 100": "^NDX",
-        "S&P 100 (OEX)": "^OEX",
-        "Russell 2000": "^RUT",
-        "NYSE Composite": "^NYA",
-        "MSCI World (ETF Proxy)": "URTH",
-        "DAX 40": "^GDAXI",
-        "Euro Stoxx 50": "^STOXX50E"
+**Formel:** `(OEX Put/Call Ratio) - (Equity Call/Put Ratio)`
+""")
+
+@st.cache_data(ttl=14400)  # Caches data for 4 hours
+def load_cboe_data():
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36'
     }
     
-    selected_market_name = st.selectbox("Wähle den Aktienindex:", list(market_options.keys()))
-    ticker_symbol = market_options[selected_market_name]
-
-    st.subheader("⏱️ Zeiträume & Durchschnitte")
-    lookback_years = st.slider("Anzeigezeitraum (Jahre):", min_value=1, max_value=10, value=5)
-    ma_period = st.slider("Gleitender Durchschnitt (Tage):", min_value=1, max_value=50, value=20)
-
-    st.subheader("🎛️ Modus der Indikator-Anzeige")
-    display_mode = st.radio(
-        "Indikator-Darstellung:",
-        [
-            "Smart vs. Dumb Money Differenz (Spread)",
-            "Einzelne Put/Call Ratios anzeigen",
-            "Kehrwerte der Ratios (Call/Put)"
-        ]
-    )
-
-    use_inversion = (display_mode == "Kehrwerte der Ratios (Call/Put)")
-
-# 3. DATEN LADEN & VERARBEITEN
-@st.cache_data(ttl=3600)
-def fetch_market_and_pcr_data(market_ticker, years):
-    # Extra Puffer für die Berechnung des Moving Averages
-    start_date = datetime.now() - timedelta(days=int(years * 365 + 200))
-    end_date = datetime.now()
-
-    # 1. Haupt-Aktienindex laden
-    df_price = yf.download(market_ticker, start=start_date, end=end_date, progress=False)
+    # Official CBOE Data Endpoints
+    equity_url = "https://cdn.cboe.com/resources/options/volume_and_call_put_ratios/equitypc.csv"
+    oex_url = "https://cdn.cboe.com/resources/options/volume_and_call_put_ratios/oexpc.csv"
     
-    # Bereinigung der MultiIndex-Spalten von yfinance
-    if isinstance(df_price.columns, pd.MultiIndex):
-        if 'Close' in df_price.columns.levels[0]:
-            df_price = df_price['Close']
-        else:
-            df_price = df_price.iloc[:, 0].to_frame()
-    elif 'Close' in df_price.columns:
-        df_price = df_price[['Close']]
+    try:
+        req_eq = requests.get(equity_url, headers=headers, timeout=10)
+        req_oex = requests.get(oex_url, headers=headers, timeout=10)
+        
+        # Read CSV skipping initial CBOE header rows
+        df_eq = pd.read_csv(io.StringIO(req_eq.text), skiprows=2)
+        df_oex = pd.read_csv(io.StringIO(req_oex.text), skiprows=2)
+        
+        # Standardize column names
+        df_eq.columns = [c.strip().upper() for c in df_eq.columns]
+        df_oex.columns = [c.strip().upper() for c in df_oex.columns]
+        
+        df_eq['DATE'] = pd.to_datetime(df_eq['DATE'], errors='coerce')
+        df_oex['DATE'] = pd.to_datetime(df_oex['DATE'], errors='coerce')
+        
+        df_eq = df_eq.dropna(subset=['DATE'])
+        df_oex = df_oex.dropna(subset=['DATE'])
+        
+        # Merge on Date
+        df = pd.merge(df_oex[['DATE', 'P/C', 'CALLS', 'PUTS']], 
+                      df_eq[['DATE', 'P/C', 'CALLS', 'PUTS']], 
+                      on='DATE', 
+                      suffixes=('_OEX', '_EQUITY'))
+        
+        # Convert numeric values
+        for col in ['P/C_OEX', 'P/C_EQUITY', 'CALLS_OEX', 'PUTS_OEX', 'CALLS_EQUITY', 'PUTS_EQUITY']:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+            
+        df = df.sort_values('DATE').reset_index(drop=True)
+        
+        # Calculate Ratios
+        # 1. OEX Put/Call Ratio
+        df['OEX_PC'] = df['P/C_OEX']
+        
+        # 2. Equity Call/Put Ratio = 1 / (Equity Put/Call Ratio)
+        df['EQUITY_CP'] = 1.0 / df['P/C_EQUITY']
+        
+        # 3. Exact Formula Spread: (OEX P/C) - (Equity C/P)
+        df['SPREAD'] = df['OEX_PC'] - df['EQUITY_CP']
+        
+        # Moving Averages for smoother analysis
+        df['SPREAD_SMA10'] = df['SPREAD'].rolling(window=10).mean()
+        df['SPREAD_SMA21'] = df['SPREAD'].rolling(window=21).mean()
+        
+        return df
 
-    if isinstance(df_price, pd.DataFrame):
-        df_price = df_price.iloc[:, 0]
+    except Exception as e:
+        st.error(f"Fehler beim Laden der CBOE-Daten: {e}")
+        return pd.DataFrame()
 
-    df_combined = pd.DataFrame({'Index_Close': df_price})
+with st.spinner("Lade echte CBOE-Daten..."):
+    df = load_cboe_data()
 
-    # 2. CBOE Put/Call Ratios laden
-    pcr_tickers = ['^CPC', '^CBOE']
-    df_pcr = yf.download(pcr_tickers, start=start_date, end=end_date, progress=False)
+if not df.empty:
+    # Timeframe selection
+    st.sidebar.header("Einstellungen")
+    days = st.sidebar.slider("Zeitraum (Tage):", min_value=30, max_value=1000, value=252)
+    
+    df_filtered = df.tail(days)
+    latest = df.iloc[-1]
+    
+    # Display Current Metrics
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Datum", latest['DATE'].strftime('%Y-%m-%d'))
+    col2.metric("OEX Put/Call (Smart)", f"{latest['OEX_PC']:.2f}")
+    col3.metric("Equity Call/Put (Dumb)", f"{latest['EQUITY_CP']:.2f}")
+    col4.metric("Spread (Smart - Dumb)", f"{latest['SPREAD']:.2f}")
 
-    if isinstance(df_pcr.columns, pd.MultiIndex):
-        if 'Close' in df_pcr.columns.levels[0]:
-            df_pcr = df_pcr['Close']
-
-    # Extraktion der Einzeldaten mit Fallback-Prüfung
-    if '^CPC' in df_pcr.columns and not df_pcr['^CPC'].dropna().empty:
-        df_combined['Equity_PCR'] = df_pcr['^CPC']
-    else:
-        # Fallback: Volatilitätsbasierte Annäherung
-        pct_change = df_combined['Index_Close'].pct_change()
-        df_combined['Equity_PCR'] = 0.65 + (pct_change.rolling(5).std() * 10).clip(0, 0.5)
-
-    if '^CBOE' in df_pcr.columns and not df_pcr['^CBOE'].dropna().empty:
-        df_combined['OEX_PCR'] = df_pcr['^CBOE']
-    else:
-        # Fallback: Trendbasierte Annäherung
-        pct_change = df_combined['Index_Close'].pct_change()
-        df_combined['OEX_PCR'] = 1.15 - (pct_change.rolling(10).mean() * 5).clip(-0.4, 0.4)
-
-    # Fehlende Werte auffüllen
-    df_combined = df_combined.ffill().bfill()
-    return df_combined
-
-# Daten abrufen
-df = fetch_market_and_pcr_data(ticker_symbol, lookback_years)
-
-# 4. BERECHNUNG DER GLEITENDEN DURCHSCHNITTE & INDIKATOREN
-df['Index_MA'] = df['Index_Close'].rolling(window=ma_period).mean()
-df['OEX_PCR_MA'] = df['OEX_PCR'].rolling(window=ma_period).mean()
-df['Equity_PCR_MA'] = df['Equity_PCR'].rolling(window=ma_period).mean()
-
-if use_inversion:
-    df['OEX_CPR_MA'] = 1 / df['OEX_PCR_MA']
-    df['Equity_CPR_MA'] = 1 / df['Equity_PCR_MA']
-
-# Spread: Smart Money P/C minus Dumb Money P/C
-df['Spread'] = df['OEX_PCR_MA'] - df['Equity_PCR_MA']
-
-# Auf gewählten Lookback-Zeitraum filtern (ca. 252 Handelstage pro Jahr)
-df_display = df.tail(lookback_years * 252)
-
-# 5. VISUALISIERUNG MIT PLOTLY
-fig = make_subplots(
-    rows=2, cols=1,
-    shared_xaxes=True,
-    vertical_spacing=0.06,
-    subplot_titles=(
-        f"Kursverlauf: {selected_market_name} (mit {ma_period}-Tage MA)",
-        f"Options-Indikator: {display_mode} ({ma_period}-Tage MA)"
-    ),
-    row_heights=[0.6, 0.4]
-)
-
-# Subplot 1: Indexkurs & Moving Average
-fig.add_trace(
-    go.Scatter(
-        x=df_display.index, 
-        y=df_display['Index_Close'], 
-        name="Index Kurs", 
-        line=dict(color='#2962FF', width=1.5)
-    ),
-    row=1, col=1
-)
-fig.add_trace(
-    go.Scatter(
-        x=df_display.index, 
-        y=df_display['Index_MA'], 
-        name=f"MA ({ma_period} Tage)", 
-        line=dict(color='#FF9100', width=2)
-    ),
-    row=1, col=1
-)
-
-# Subplot 2: Modus-spezifische Indikatoren
-if display_mode == "Smart vs. Dumb Money Differenz (Spread)":
-    fig.add_trace(
-        go.Scatter(
-            x=df_display.index, 
-            y=df_display['Spread'], 
-            name="Smart (OEX) - Dumb (Equity) Spread", 
-            line=dict(color='#AA00FF', width=2)
-        ),
-        row=2, col=1
+    # Plot Chart
+    fig = make_subplots(
+        rows=2, cols=1, 
+        shared_xaxes=True, 
+        vertical_spacing=0.08,
+        subplot_titles=("Smart vs. Dumb Money Spread", "Einzelkomponenten (OEX P/C vs. Equity C/P)")
     )
-    # Dynamische Nulllinie
-    fig.add_hline(y=0, line_dash="dash", line_color="gray", row=2, col=1)
 
-elif display_mode == "Einzelne Put/Call Ratios anzeigen":
+    # Top Plot: Spread
     fig.add_trace(
-        go.Scatter(
-            x=df_display.index, 
-            y=df_display['OEX_PCR_MA'], 
-            name="Smart Money (OEX P/C MA)", 
-            line=dict(color='#00E676', width=2)
-        ),
+        plt.Scatter(x=df_filtered['DATE'], y=df_filtered['SPREAD'], name="Spread (Täglich)", line=dict(color='gray', width=1), opacity=0.5),
+        row=1, col=1
+    )
+    fig.add_trace(
+        plt.Scatter(x=df_filtered['DATE'], y=df_filtered['SPREAD_SMA10'], name="Spread (10-Tage SMA)", line=dict(color='blue', width=2)),
+        row=1, col=1
+    )
+    fig.add_trace(
+        plt.Scatter(x=df_filtered['DATE'], y=df_filtered['SPREAD_SMA21'], name="Spread (21-Tage SMA)", line=dict(color='orange', width=2)),
+        row=1, col=1
+    )
+
+    # Bottom Plot: Components
+    fig.add_trace(
+        plt.Scatter(x=df_filtered['DATE'], y=df_filtered['OEX_PC'], name="OEX P/C (Smart Money)", line=dict(color='green', width=1.5)),
         row=2, col=1
     )
     fig.add_trace(
-        go.Scatter(
-            x=df_display.index, 
-            y=df_display['Equity_PCR_MA'], 
-            name="Dumb Money (Equity P/C MA)", 
-            line=dict(color='#FF1744', width=2)
-        ),
+        plt.Scatter(x=df_filtered['DATE'], y=df_filtered['EQUITY_CP'], name="Equity C/P (Dumb Money)", line=dict(color='red', width=1.5)),
         row=2, col=1
     )
 
-else:  # Kehrwerte (Call/Put Ratios)
-    fig.add_trace(
-        go.Scatter(
-            x=df_display.index, 
-            y=df_display['OEX_CPR_MA'], 
-            name="Smart Money (OEX Call/Put MA)", 
-            line=dict(color='#00E676', width=2)
-        ),
-        row=2, col=1
-    )
-    fig.add_trace(
-        go.Scatter(
-            x=df_display.index, 
-            y=df_display['Equity_CPR_MA'], 
-            name="Dumb Money (Equity Call/Put MA)", 
-            line=dict(color='#FF1744', width=2)
-        ),
-        row=2, col=1
-    )
+    fig.update_layout(height=700, template="plotly_white", hovermode="x unified")
+    fig.update_yaxes(title_text="Spread Index", row=1, col=1)
+    fig.update_yaxes(title_text="Ratio", row=2, col=1)
 
-fig.update_layout(
-    template="plotly_dark",
-    height=750,
-    showlegend=True,
-    xaxis_rangeslider_visible=False,
-    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-    margin=dict(l=20, r=20, t=60, b=20)
-)
+    st.plotly_chart(fig, use_container_width=True)
 
-st.plotly_chart(fig, use_container_width=True)
-
-# 6. METRIKEN UND KENNZAHLEN
-col1, col2, col3, col4 = st.columns(4)
-col1.metric("Aktueller Indexkurs", f"{df_display['Index_Close'].iloc[-1]:,.2f}")
-col2.metric(f"Index {ma_period}-Tage MA", f"{df_display['Index_MA'].iloc[-1]:,.2f}")
-col3.metric("OEX P/C Ratio (MA)", f"{df_display['OEX_PCR_MA'].iloc[-1]:.3f}")
-col4.metric("Equity P/C Ratio (MA)", f"{df_display['Equity_PCR_MA'].iloc[-1]:.3f}")
-
-st.info("💡 **Analyse-Tipp:** Ein hoher Spread (OEX P/C Ratio deutlich über Equity P/C Ratio) signalisiert oft, dass institutionelle Anleger (Smart Money) Absicherungen aufbauen, während Kleinanleger (Dumb Money) optimistisch bleiben. Dies gilt historisch als Warnsignal für erhöhte Marktvolatilität.")
+    with st.expander("Rohdaten anzeigen"):
+        st.dataframe(df_filtered[['DATE', 'OEX_PC', 'EQUITY_CP', 'SPREAD', 'SPREAD_SMA10']].sort_values('DATE', ascending=False))
