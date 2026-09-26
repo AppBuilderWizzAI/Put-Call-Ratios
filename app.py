@@ -25,24 +25,19 @@ Dieses Dashboard vergleicht das Absicherungsverhalten professioneller Akteure (*
 mit der Spekulation von Kleinanlegern (**Dumb Money** im Einzelaktien-Markt).
 
 * **Smart Money:** CBOE Index Put/Call Ratio (`INDEX_PC`)
-* **Dumb Money:** CBOE Equity Call/Put Ratio ($1 / \\text{EQUITY\\_PC}$)
-* **Spread / Indikator:** $\\text{Index P/C} - \\left(\\frac{1}{\\text{Equity P/C}}\\right)$
-
-ℹ️ **Datenquelle:** Die historischen CBOE Put/Call-Ratios werden über die
-[Equibles-API](https://equibles.com/docs/api/endpoints/sentiment) bezogen.
+* **Dumb Money:** CBOE Equity Put/Call Ratio (`EQUITY_PC`)
+* **Spread / Indikator:** $\\text{Index P/C} - \\text{Equity P/C}$
 """)
 
 # --- SIDEBAR EINSTELLUNGEN ---
 st.sidebar.header("⚙️ Einstellungen")
 
-# Zeitraum
 days = st.sidebar.slider(
-    "Zeitraum (Anzahl Tage):", min_value=30, max_value=1000, value=252
+    "Zeitraum (Anzahl Tage):", min_value=30, max_value=3650, value=252, step=10
 )
 
-# SMA-Periode (eine Einstellung für alle Berechnungen)
 sma_period = st.sidebar.slider(
-    "SMA-Periode (Tage):", min_value=5, max_value=100, value=10
+    "SMA-Periode (Tage):", min_value=5, max_value=200, value=20
 )
 
 st.sidebar.divider()
@@ -54,7 +49,6 @@ show_index = st.sidebar.checkbox("Aktienindex anzeigen", value=True)
 
 st.sidebar.divider()
 
-# Aktienindex-Auswahl
 INDEX_OPTIONS = {
     "Kein Index": None,
     "S&P 500": "^GSPC",
@@ -64,9 +58,7 @@ INDEX_OPTIONS = {
     "Euro Stoxx 50": "^STOXX50E",
 }
 selected_index_name = st.sidebar.selectbox(
-    "Aktienindex:",
-    options=list(INDEX_OPTIONS.keys()),
-    index=1,
+    "Aktienindex:", options=list(INDEX_OPTIONS.keys()), index=1
 )
 selected_index_ticker = INDEX_OPTIONS[selected_index_name]
 
@@ -76,15 +68,10 @@ if st.sidebar.button("🔄 Live-Daten neu laden"):
 
 st.sidebar.divider()
 
-# API-Key bevorzugt aus Secrets lesen
 api_key = st.secrets.get("EQUIBLES_API_KEY", "")
-
 if not api_key:
     st.sidebar.subheader("🔑 Equibles API-Key")
-    api_key = st.sidebar.text_input(
-        "API-Key (beginnt mit 'eq_')",
-        type="password",
-    )
+    api_key = st.sidebar.text_input("API-Key (beginnt mit 'eq_')", type="password")
 else:
     st.sidebar.success("✅ API-Key aus Secrets geladen")
 
@@ -98,15 +85,16 @@ def _fetch_equibles_series(
 ) -> pd.DataFrame:
     """Holt eine Put/Call-Ratio-Zeitreihe von der Equibles-API.
 
-    Lädt ALLE Seiten bis meta.hasMore False ist.
-    Die API liefert die Daten absteigend sortiert (neueste zuerst).
+    Paginiert robust: läuft so lange, bis eine Seite weniger als page_limit
+    Zeilen zurückliefert ODER hasMore explizit False ist.
     """
     headers = {"Authorization": f"Bearer {api_key}"}
     all_rows = []
     offset = 0
     page_limit = 500
+    max_pages = 30  # Sicherheitsnetz gegen Endlosschleifen
 
-    while True:
+    for _ in range(max_pages):
         params = {
             "type": series_type,
             "limit": page_limit,
@@ -114,7 +102,6 @@ def _fetch_equibles_series(
             "startDate": start_date,
             "endDate": end_date,
         }
-
         resp = requests.get(EQUIBLES_BASE, headers=headers, params=params, timeout=30)
         if resp.status_code == 401:
             raise RuntimeError("Equibles-API-Key ungültig oder abgelaufen.")
@@ -128,9 +115,12 @@ def _fetch_equibles_series(
             break
         all_rows.extend(rows)
 
-        meta = payload.get("meta", {})
-        if not meta.get("hasMore", False):
+        # Abbruchbedingungen: kürzere Seite ODER explizit hasMore=False
+        if len(rows) < page_limit:
             break
+        if not payload.get("meta", {}).get("hasMore", True):
+            break
+
         offset += page_limit
         time.sleep(0.25)
 
@@ -141,15 +131,14 @@ def _fetch_equibles_series(
     df = df.rename(columns={"date": "DATE", "putCallRatio": "RATIO"})
     df["DATE"] = pd.to_datetime(df["DATE"])
     df["RATIO"] = pd.to_numeric(df["RATIO"], errors="coerce")
-    # Aufsteigend sortieren (API liefert absteigend)
     return df[["DATE", "RATIO"]].dropna().sort_values("DATE").reset_index(drop=True)
 
 
 def fetch_equibles_data(api_key: str, days: int) -> pd.DataFrame:
     """Lädt Index- und Equity-Put/Call-Ratio für den gewünschten Zeitraum."""
-    # Startdatum berechnen: etwas Puffer für SMA-Berechnung
     end_dt = datetime.now()
-    start_dt = end_dt - timedelta(days=days + 150)  # Puffer für SMA
+    # Puffer für SMA-Berechnung, damit die ersten Werte nicht NaN sind
+    start_dt = end_dt - timedelta(days=days + sma_period * 3)
 
     start_date = start_dt.strftime("%Y-%m-%d")
     end_date = end_dt.strftime("%Y-%m-%d")
@@ -160,8 +149,7 @@ def fetch_equibles_data(api_key: str, days: int) -> pd.DataFrame:
     df_index = df_index.rename(columns={"RATIO": "INDEX_PC"})
     df_equity = df_equity.rename(columns={"RATIO": "EQUITY_PC"})
 
-    df = pd.merge(df_index, df_equity, on="DATE", how="inner")
-    return df
+    return pd.merge(df_index, df_equity, on="DATE", how="inner")
 
 
 # --- AKTIENINDEX VIA YFINANCE ---
@@ -171,10 +159,9 @@ def fetch_index_data(ticker: str, days: int) -> pd.DataFrame:
     if not YFINANCE_AVAILABLE:
         raise RuntimeError("yfinance ist nicht installiert.")
 
-    # Zeitraum etwas großzügiger für SMA
-    period_days = days + 150
     end_dt = datetime.now()
-    start_dt = end_dt - timedelta(days=period_days)
+    # Etwas mehr Vorlauf, damit SMA auch am Anfang berechnet werden kann
+    start_dt = end_dt - timedelta(days=days + 200)
 
     hist = yf.Ticker(ticker).history(
         start=start_dt.strftime("%Y-%m-%d"),
@@ -193,16 +180,18 @@ def fetch_index_data(ticker: str, days: int) -> pd.DataFrame:
 
 # --- HILFSFUNKTIONEN ---
 def _add_derived_columns(df: pd.DataFrame, sma_period: int) -> pd.DataFrame:
-    """Berechnet abgeleitete Spalten mit dynamischer SMA-Periode."""
+    """Berechnet abgeleitete Spalten. Spread = INDEX_PC - EQUITY_PC."""
     df["DATE"] = pd.to_datetime(df["DATE"])
     df["INDEX_PC"] = pd.to_numeric(df["INDEX_PC"], errors="coerce")
     df["EQUITY_PC"] = pd.to_numeric(df["EQUITY_PC"], errors="coerce")
-    df = df.dropna().sort_values("DATE")
-    df["EQUITY_CP"] = 1.0 / df["EQUITY_PC"]
-    df["SPREAD"] = df["INDEX_PC"] - df["EQUITY_CP"]
+    df = df.dropna().sort_values("DATE").reset_index(drop=True)
+
+    # KORRIGIERT: Spread ist die einfache Differenz der beiden Put/Call-Ratios
+    df["SPREAD"] = df["INDEX_PC"] - df["EQUITY_PC"]
+
     df["SPREAD_SMA"] = df["SPREAD"].rolling(window=sma_period).mean()
     df["INDEX_PC_SMA"] = df["INDEX_PC"].rolling(window=sma_period).mean()
-    df["EQUITY_CP_SMA"] = df["EQUITY_CP"].rolling(window=sma_period).mean()
+    df["EQUITY_PC_SMA"] = df["EQUITY_PC"].rolling(window=sma_period).mean()
     return df
 
 
@@ -263,7 +252,6 @@ try:
 except Exception as e:
     load_error = e
 
-# Index separat laden (Fehler hier blockiert das Dashboard nicht)
 if selected_index_ticker and show_index:
     try:
         with st.spinner(f"Lade {selected_index_name}-Daten..."):
@@ -277,16 +265,14 @@ if load_error is not None:
         st.code(str(load_error))
     st.stop()
 
-# --- DATEN FILTERN: Nur die letzten `days` Tage anzeigen ---
+# --- DATEN FILTERN ---
+# P/C-Daten: letzte `days` Zeilen
 df_filtered = df.tail(days).copy()
 
-# Index auf denselben Zeitraum filtern
-if df_index is not None:
-    min_date = df_filtered["DATE"].min()
-    max_date = df_filtered["DATE"].max()
-    df_index_filtered = df_index[
-        (df_index["DATE"] >= min_date) & (df_index["DATE"] <= max_date)
-    ].copy()
+# Index-Daten: unabhängig vom P/C-Zeitraum ebenfalls letzte `days` Zeilen
+# (so funktioniert 10-Jahres-Ansicht auch, wenn P/C nur kürzer verfügbar ist)
+if df_index is not None and not df_index.empty:
+    df_index_filtered = df_index.tail(days).copy()
     df_index_filtered["INDEX_SMA"] = (
         df_index_filtered["CLOSE"].rolling(window=sma_period).mean()
     )
@@ -295,14 +281,14 @@ else:
 
 latest = df_filtered.iloc[-1]
 
-# --- KENNZAHLEN (METRICS) ---
+# --- KENNZAHLEN ---
 col1, col2, col3, col4 = st.columns(4)
 col1.metric("Datum", latest["DATE"].strftime("%Y-%m-%d"))
 col2.metric("Index P/C (Smart)", f"{latest['INDEX_PC']:.2f}")
-col3.metric("Equity C/P (Dumb)", f"{latest['EQUITY_CP']:.2f}")
-col4.metric("Spread (Smart - Dumb)", f"{latest['SPREAD']:.2f}")
+col3.metric("Equity P/C (Dumb)", f"{latest['EQUITY_PC']:.2f}")
+col4.metric("Spread (Smart − Dumb)", f"{latest['SPREAD']:.2f}")
 
-# --- CHARTS ERSTELLEN (dynamisch je nach Auswahl) ---
+# --- CHARTS ERSTELLEN ---
 active_panels = []
 if show_spread:
     active_panels.append("spread")
@@ -318,7 +304,7 @@ if not active_panels:
 n_rows = len(active_panels)
 panel_titles = {
     "spread": "Smart vs. Dumb Money Spread Index",
-    "components": "Einzelkomponenten (Index P/C vs. Equity C/P)",
+    "components": "Einzelkomponenten (Index P/C vs. Equity P/C)",
     "index": f"{selected_index_name} (Schlusskurs + SMA {sma_period})",
 }
 
@@ -326,7 +312,7 @@ fig = make_subplots(
     rows=n_rows,
     cols=1,
     shared_xaxes=True,
-    vertical_spacing=0.06,
+    vertical_spacing=0.07,
     subplot_titles=tuple(panel_titles[p] for p in active_panels),
 )
 
@@ -336,13 +322,15 @@ for panel in active_panels:
         fig.add_trace(
             go.Scatter(
                 x=df_filtered["DATE"], y=df_filtered["SPREAD"],
-                name="Spread (Täglich)", line=dict(color="lightgray", width=1),
+                name="Spread (Täglich)",
+                line=dict(color="rgba(160,160,160,0.6)", width=1),
             ), row=row, col=1,
         )
         fig.add_trace(
             go.Scatter(
                 x=df_filtered["DATE"], y=df_filtered["SPREAD_SMA"],
-                name=f"Spread SMA {sma_period}", line=dict(color="#1f77b4", width=2),
+                name=f"Spread SMA {sma_period}",
+                line=dict(color="#1f77b4", width=2.2),
             ), row=row, col=1,
         )
         fig.update_yaxes(title_text="Spread Index", row=row, col=1)
@@ -351,44 +339,50 @@ for panel in active_panels:
         fig.add_trace(
             go.Scatter(
                 x=df_filtered["DATE"], y=df_filtered["INDEX_PC"],
-                name="Index P/C", line=dict(color="darkcyan", width=1.5),
+                name="Index P/C",
+                line=dict(color="#00BFC4", width=1.5),
             ), row=row, col=1,
         )
         fig.add_trace(
             go.Scatter(
                 x=df_filtered["DATE"], y=df_filtered["INDEX_PC_SMA"],
                 name=f"Index P/C SMA {sma_period}",
-                line=dict(color="darkcyan", width=2, dash="dot"),
+                line=dict(color="#00BFC4", width=2.2, dash="dot"),
             ), row=row, col=1,
         )
         fig.add_trace(
             go.Scatter(
-                x=df_filtered["DATE"], y=df_filtered["EQUITY_CP"],
-                name="Equity C/P", line=dict(color="crimson", width=1.5),
+                x=df_filtered["DATE"], y=df_filtered["EQUITY_PC"],
+                name="Equity P/C",
+                line=dict(color="#F8766D", width=1.5),
             ), row=row, col=1,
         )
         fig.add_trace(
             go.Scatter(
-                x=df_filtered["DATE"], y=df_filtered["EQUITY_CP_SMA"],
-                name=f"Equity C/P SMA {sma_period}",
-                line=dict(color="crimson", width=2, dash="dot"),
+                x=df_filtered["DATE"], y=df_filtered["EQUITY_PC_SMA"],
+                name=f"Equity P/C SMA {sma_period}",
+                line=dict(color="#F8766D", width=2.2, dash="dot"),
             ), row=row, col=1,
         )
         fig.update_yaxes(title_text="Ratio", row=row, col=1)
 
     elif panel == "index":
+        # Tageskurs: kräftige, auf hell UND dunkel sichtbare Farbe
         fig.add_trace(
             go.Scatter(
                 x=df_index_filtered["DATE"], y=df_index_filtered["CLOSE"],
-                name=f"{selected_index_name} (Close)",
-                line=dict(color="black", width=1.5),
+                name=f"{selected_index_name} (Tageskurs)",
+                line=dict(color="#4FC3F7", width=1.6),
+                hovertemplate="%{y:,.0f}<extra></extra>",
             ), row=row, col=1,
         )
+        # Gleitender Durchschnitt darüber
         fig.add_trace(
             go.Scatter(
                 x=df_index_filtered["DATE"], y=df_index_filtered["INDEX_SMA"],
                 name=f"{selected_index_name} SMA {sma_period}",
-                line=dict(color="orange", width=2),
+                line=dict(color="#FFA726", width=2.4),
+                hovertemplate="%{y:,.0f}<extra></extra>",
             ), row=row, col=1,
         )
         fig.update_yaxes(title_text="Index-Stand", row=row, col=1)
@@ -400,20 +394,21 @@ fig.update_layout(
     template="plotly_white",
     hovermode="x unified",
     legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+    margin=dict(l=40, r=20, t=60, b=40),
 )
 
 st.plotly_chart(fig, use_container_width=True)
 
-# --- ROHDATEN TABELLE ---
+# --- ROHDATEN ---
 with st.expander("📊 Live-Rohdaten anzeigen"):
     st.dataframe(
         df_filtered[[
-            "DATE", "INDEX_PC", "EQUITY_PC", "EQUITY_CP", "SPREAD", "SPREAD_SMA",
+            "DATE", "INDEX_PC", "EQUITY_PC", "SPREAD", "SPREAD_SMA",
         ]].sort_values("DATE", ascending=False),
         use_container_width=True,
     )
 
-# --- OPTIONALER PLAUSIBILITÄTS-CHECK ---
+# --- PLAUSIBILITÄTS-CHECK ---
 st.divider()
 with st.expander("🔎 Live-Abgleich mit der offiziellen Cboe-Quelle (heutiger Wert)"):
     st.caption(
