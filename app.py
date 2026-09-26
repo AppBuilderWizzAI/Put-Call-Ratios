@@ -1,4 +1,5 @@
 import time
+from datetime import datetime, timedelta
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -29,7 +30,6 @@ mit der Spekulation von Kleinanlegern (**Dumb Money** im Einzelaktien-Markt).
 
 ℹ️ **Datenquelle:** Die historischen CBOE Put/Call-Ratios werden über die
 [Equibles-API](https://equibles.com/docs/api/endpoints/sentiment) bezogen.
-Die kostenlose Stufe erlaubt 100 Requests/Tag.
 """)
 
 # --- SIDEBAR EINSTELLUNGEN ---
@@ -40,10 +40,19 @@ days = st.sidebar.slider(
     "Zeitraum (Anzahl Tage):", min_value=30, max_value=1000, value=252
 )
 
-# SMA-Periode (eine Einstellung für beide Berechnungen)
+# SMA-Periode (eine Einstellung für alle Berechnungen)
 sma_period = st.sidebar.slider(
     "SMA-Periode (Tage):", min_value=5, max_value=100, value=10
 )
+
+st.sidebar.divider()
+st.sidebar.subheader("📊 Chart-Fenster")
+
+show_spread = st.sidebar.checkbox("Spread-Chart anzeigen", value=True)
+show_components = st.sidebar.checkbox("Einzelkomponenten anzeigen", value=True)
+show_index = st.sidebar.checkbox("Aktienindex anzeigen", value=True)
+
+st.sidebar.divider()
 
 # Aktienindex-Auswahl
 INDEX_OPTIONS = {
@@ -55,9 +64,9 @@ INDEX_OPTIONS = {
     "Euro Stoxx 50": "^STOXX50E",
 }
 selected_index_name = st.sidebar.selectbox(
-    "Aktienindex anzeigen:",
+    "Aktienindex:",
     options=list(INDEX_OPTIONS.keys()),
-    index=1,  # Standard: S&P 500
+    index=1,
 )
 selected_index_ticker = INDEX_OPTIONS[selected_index_name]
 
@@ -67,7 +76,7 @@ if st.sidebar.button("🔄 Live-Daten neu laden"):
 
 st.sidebar.divider()
 
-# API-Key bevorzugt aus Secrets lesen, sonst manuell abfragen
+# API-Key bevorzugt aus Secrets lesen
 api_key = st.secrets.get("EQUIBLES_API_KEY", "")
 
 if not api_key:
@@ -75,28 +84,9 @@ if not api_key:
     api_key = st.sidebar.text_input(
         "API-Key (beginnt mit 'eq_')",
         type="password",
-        help=(
-            "Kostenlos erhältlich unter https://equibles.com – "
-            "Registrierung dauert unter einer Minute."
-        ),
     )
 else:
     st.sidebar.success("✅ API-Key aus Secrets geladen")
-
-st.sidebar.divider()
-st.sidebar.subheader("🆘 Fallback-Datenquelle")
-use_csv_fallback = st.sidebar.toggle(
-    "Eigene CSV statt Live-Abruf verwenden",
-    help=(
-        "Falls der Live-Abruf blockiert wird oder kein API-Key vorliegt, "
-        "kannst du hier eine eigene CSV mit den Spalten DATE, INDEX_PC, EQUITY_PC hochladen."
-    ),
-)
-uploaded_csv = None
-if use_csv_fallback:
-    uploaded_csv = st.sidebar.file_uploader(
-        "CSV hochladen (Spalten: DATE, INDEX_PC, EQUITY_PC)", type=["csv"]
-    )
 
 
 # --- EQUIBLES API ---
@@ -104,26 +94,26 @@ EQUIBLES_BASE = "https://api.equibles.com/v1/market/put-call-ratios"
 
 
 def _fetch_equibles_series(
-    series_type: str, api_key: str, start_date: str | None = None
+    series_type: str, api_key: str, start_date: str, end_date: str
 ) -> pd.DataFrame:
     """Holt eine Put/Call-Ratio-Zeitreihe von der Equibles-API.
 
     Lädt ALLE Seiten bis meta.hasMore False ist.
-    series_type: 'Index' oder 'Equity' (auch 'Total', 'Vix', 'Etp').
+    Die API liefert die Daten absteigend sortiert (neueste zuerst).
     """
     headers = {"Authorization": f"Bearer {api_key}"}
     all_rows = []
     offset = 0
-    page_limit = 500  # Maximum laut API-Doku[reference:4]
+    page_limit = 500
 
     while True:
         params = {
             "type": series_type,
             "limit": page_limit,
             "offset": offset,
+            "startDate": start_date,
+            "endDate": end_date,
         }
-        if start_date:
-            params["startDate"] = start_date
 
         resp = requests.get(EQUIBLES_BASE, headers=headers, params=params, timeout=30)
         if resp.status_code == 401:
@@ -142,7 +132,7 @@ def _fetch_equibles_series(
         if not meta.get("hasMore", False):
             break
         offset += page_limit
-        time.sleep(0.25)  # sanfte Drosselung gegen Rate-Limit
+        time.sleep(0.25)
 
     if not all_rows:
         raise RuntimeError(f"Equibles-API lieferte keine Daten für '{series_type}'.")
@@ -151,13 +141,21 @@ def _fetch_equibles_series(
     df = df.rename(columns={"date": "DATE", "putCallRatio": "RATIO"})
     df["DATE"] = pd.to_datetime(df["DATE"])
     df["RATIO"] = pd.to_numeric(df["RATIO"], errors="coerce")
+    # Aufsteigend sortieren (API liefert absteigend)
     return df[["DATE", "RATIO"]].dropna().sort_values("DATE").reset_index(drop=True)
 
 
-def fetch_equibles_data(api_key: str) -> pd.DataFrame:
-    """Lädt Index- und Equity-Put/Call-Ratio und führt sie zusammen."""
-    df_index = _fetch_equibles_series("Index", api_key)
-    df_equity = _fetch_equibles_series("Equity", api_key)
+def fetch_equibles_data(api_key: str, days: int) -> pd.DataFrame:
+    """Lädt Index- und Equity-Put/Call-Ratio für den gewünschten Zeitraum."""
+    # Startdatum berechnen: etwas Puffer für SMA-Berechnung
+    end_dt = datetime.now()
+    start_dt = end_dt - timedelta(days=days + 150)  # Puffer für SMA
+
+    start_date = start_dt.strftime("%Y-%m-%d")
+    end_date = end_dt.strftime("%Y-%m-%d")
+
+    df_index = _fetch_equibles_series("Index", api_key, start_date, end_date)
+    df_equity = _fetch_equibles_series("Equity", api_key, start_date, end_date)
 
     df_index = df_index.rename(columns={"RATIO": "INDEX_PC"})
     df_equity = df_equity.rename(columns={"RATIO": "EQUITY_PC"})
@@ -168,12 +166,22 @@ def fetch_equibles_data(api_key: str) -> pd.DataFrame:
 
 # --- AKTIENINDEX VIA YFINANCE ---
 @st.cache_data(ttl=3600, show_spinner=False)
-def fetch_index_data(ticker: str, period: str = "5y") -> pd.DataFrame:
+def fetch_index_data(ticker: str, days: int) -> pd.DataFrame:
     """Holt historische Schlusskurse eines Index über yfinance."""
     if not YFINANCE_AVAILABLE:
-        raise RuntimeError("yfinance ist nicht installiert – bitte requirements.txt prüfen.")
+        raise RuntimeError("yfinance ist nicht installiert.")
 
-    hist = yf.Ticker(ticker).history(period=period, interval="1d", auto_adjust=False)
+    # Zeitraum etwas großzügiger für SMA
+    period_days = days + 150
+    end_dt = datetime.now()
+    start_dt = end_dt - timedelta(days=period_days)
+
+    hist = yf.Ticker(ticker).history(
+        start=start_dt.strftime("%Y-%m-%d"),
+        end=end_dt.strftime("%Y-%m-%d"),
+        interval="1d",
+        auto_adjust=False,
+    )
     if hist is None or hist.empty:
         raise RuntimeError(f"yfinance lieferte keine Daten für '{ticker}'.")
 
@@ -193,21 +201,14 @@ def _add_derived_columns(df: pd.DataFrame, sma_period: int) -> pd.DataFrame:
     df["EQUITY_CP"] = 1.0 / df["EQUITY_PC"]
     df["SPREAD"] = df["INDEX_PC"] - df["EQUITY_CP"]
     df["SPREAD_SMA"] = df["SPREAD"].rolling(window=sma_period).mean()
+    df["INDEX_PC_SMA"] = df["INDEX_PC"].rolling(window=sma_period).mean()
+    df["EQUITY_CP_SMA"] = df["EQUITY_CP"].rolling(window=sma_period).mean()
     return df
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def load_live_data(api_key: str, sma_period: int) -> pd.DataFrame:
-    df = fetch_equibles_data(api_key)
-    return _add_derived_columns(df, sma_period)
-
-
-def load_csv_data(uploaded_file, sma_period: int) -> pd.DataFrame:
-    df = pd.read_csv(uploaded_file)
-    required = {"DATE", "INDEX_PC", "EQUITY_PC"}
-    missing = required - set(df.columns)
-    if missing:
-        raise ValueError(f"Der CSV fehlen die Spalten: {', '.join(sorted(missing))}")
+def load_live_data(api_key: str, days: int, sma_period: int) -> pd.DataFrame:
+    df = fetch_equibles_data(api_key, days)
     return _add_derived_columns(df, sma_period)
 
 
@@ -249,34 +250,24 @@ df = None
 df_index = None
 load_error = None
 
-if use_csv_fallback:
-    if uploaded_csv is not None:
-        try:
-            df = load_csv_data(uploaded_csv, sma_period)
-        except Exception as e:
-            load_error = e
-    else:
-        st.info("⬅️ Bitte in der Seitenleiste eine CSV-Datei hochladen.")
-        st.stop()
-else:
-    if not api_key:
-        st.info(
-            "⬅️ Bitte in der Seitenleiste einen Equibles-API-Key eingeben. "
-            "Kostenlos erhältlich unter https://equibles.com"
-        )
-        st.stop()
+if not api_key:
+    st.info(
+        "⬅️ Bitte in der Seitenleiste einen Equibles-API-Key eingeben. "
+        "Kostenlos erhältlich unter https://equibles.com"
+    )
+    st.stop()
 
-    try:
-        with st.spinner("Lade Put/Call-Ratio-Daten von Equibles..."):
-            df = load_live_data(api_key, sma_period)
-    except Exception as e:
-        load_error = e
+try:
+    with st.spinner("Lade Put/Call-Ratio-Daten von Equibles..."):
+        df = load_live_data(api_key, days, sma_period)
+except Exception as e:
+    load_error = e
 
 # Index separat laden (Fehler hier blockiert das Dashboard nicht)
-if selected_index_ticker:
+if selected_index_ticker and show_index:
     try:
         with st.spinner(f"Lade {selected_index_name}-Daten..."):
-            df_index = fetch_index_data(selected_index_ticker)
+            df_index = fetch_index_data(selected_index_ticker, days)
     except Exception as e:
         st.warning(f"⚠️ Indexdaten für {selected_index_name} konnten nicht geladen werden: {e}")
 
@@ -284,18 +275,9 @@ if load_error is not None:
     st.error("❌ Der automatische Live-Abruf ist fehlgeschlagen.")
     with st.expander("🔍 Technische Details zum Fehler", expanded=True):
         st.code(str(load_error))
-    st.warning(
-        "**Häufigste Ursachen:**\n"
-        "- Der Equibles-API-Key fehlt oder ist ungültig (beginnt mit `eq_`).\n"
-        "- Das tägliche Rate-Limit von 100 Requests ist erreicht.\n\n"
-        "**Optionen:**\n"
-        "- API-Key unter https://equibles.com prüfen.\n"
-        "- Auf **'🔄 Live-Daten neu laden'** klicken.\n"
-        "- Links auf **'Eigene CSV statt Live-Abruf verwenden'** umschalten."
-    )
     st.stop()
 
-# --- DATEN FILTERN ---
+# --- DATEN FILTERN: Nur die letzten `days` Tage anzeigen ---
 df_filtered = df.tail(days).copy()
 
 # Index auf denselben Zeitraum filtern
@@ -305,14 +287,13 @@ if df_index is not None:
     df_index_filtered = df_index[
         (df_index["DATE"] >= min_date) & (df_index["DATE"] <= max_date)
     ].copy()
-    # Index-SMA mit derselben Periode berechnen
     df_index_filtered["INDEX_SMA"] = (
         df_index_filtered["CLOSE"].rolling(window=sma_period).mean()
     )
 else:
     df_index_filtered = None
 
-latest = df.iloc[-1]
+latest = df_filtered.iloc[-1]
 
 # --- KENNZAHLEN (METRICS) ---
 col1, col2, col3, col4 = st.columns(4)
@@ -321,77 +302,105 @@ col2.metric("Index P/C (Smart)", f"{latest['INDEX_PC']:.2f}")
 col3.metric("Equity C/P (Dumb)", f"{latest['EQUITY_CP']:.2f}")
 col4.metric("Spread (Smart - Dumb)", f"{latest['SPREAD']:.2f}")
 
-# --- CHARTS ERSTELLEN ---
-has_index = df_index_filtered is not None and not df_index_filtered.empty
-n_rows = 3 if has_index else 2
+# --- CHARTS ERSTELLEN (dynamisch je nach Auswahl) ---
+active_panels = []
+if show_spread:
+    active_panels.append("spread")
+if show_components:
+    active_panels.append("components")
+if show_index and df_index_filtered is not None and not df_index_filtered.empty:
+    active_panels.append("index")
+
+if not active_panels:
+    st.info("ℹ️ Bitte mindestens ein Chart-Fenster in der Seitenleiste aktivieren.")
+    st.stop()
+
+n_rows = len(active_panels)
+panel_titles = {
+    "spread": "Smart vs. Dumb Money Spread Index",
+    "components": "Einzelkomponenten (Index P/C vs. Equity C/P)",
+    "index": f"{selected_index_name} (Schlusskurs + SMA {sma_period})",
+}
 
 fig = make_subplots(
     rows=n_rows,
     cols=1,
     shared_xaxes=True,
     vertical_spacing=0.06,
-    subplot_titles=(
-        "Smart vs. Dumb Money Spread Index",
-        "Einzelkomponenten (Index P/C vs. Equity C/P)",
-        f"{selected_index_name} (Schlusskurs + SMA {sma_period})" if has_index else "",
-    )[:n_rows],
+    subplot_titles=tuple(panel_titles[p] for p in active_panels),
 )
 
-# --- Subplot 1: Spread ---
-fig.add_trace(
-    go.Scatter(
-        x=df_filtered["DATE"], y=df_filtered["SPREAD"],
-        name="Spread (Täglich)", line=dict(color="lightgray", width=1),
-    ), row=1, col=1,
-)
-fig.add_trace(
-    go.Scatter(
-        x=df_filtered["DATE"], y=df_filtered["SPREAD_SMA"],
-        name=f"Spread SMA {sma_period}", line=dict(color="#1f77b4", width=2),
-    ), row=1, col=1,
-)
+row = 1
+for panel in active_panels:
+    if panel == "spread":
+        fig.add_trace(
+            go.Scatter(
+                x=df_filtered["DATE"], y=df_filtered["SPREAD"],
+                name="Spread (Täglich)", line=dict(color="lightgray", width=1),
+            ), row=row, col=1,
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=df_filtered["DATE"], y=df_filtered["SPREAD_SMA"],
+                name=f"Spread SMA {sma_period}", line=dict(color="#1f77b4", width=2),
+            ), row=row, col=1,
+        )
+        fig.update_yaxes(title_text="Spread Index", row=row, col=1)
 
-# --- Subplot 2: Einzelkomponenten ---
-fig.add_trace(
-    go.Scatter(
-        x=df_filtered["DATE"], y=df_filtered["INDEX_PC"],
-        name="Index P/C (Smart Money)", line=dict(color="darkcyan", width=1.5),
-    ), row=2, col=1,
-)
-fig.add_trace(
-    go.Scatter(
-        x=df_filtered["DATE"], y=df_filtered["EQUITY_CP"],
-        name="Equity C/P (Dumb Money)", line=dict(color="crimson", width=1.5),
-    ), row=2, col=1,
-)
+    elif panel == "components":
+        fig.add_trace(
+            go.Scatter(
+                x=df_filtered["DATE"], y=df_filtered["INDEX_PC"],
+                name="Index P/C", line=dict(color="darkcyan", width=1.5),
+            ), row=row, col=1,
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=df_filtered["DATE"], y=df_filtered["INDEX_PC_SMA"],
+                name=f"Index P/C SMA {sma_period}",
+                line=dict(color="darkcyan", width=2, dash="dot"),
+            ), row=row, col=1,
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=df_filtered["DATE"], y=df_filtered["EQUITY_CP"],
+                name="Equity C/P", line=dict(color="crimson", width=1.5),
+            ), row=row, col=1,
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=df_filtered["DATE"], y=df_filtered["EQUITY_CP_SMA"],
+                name=f"Equity C/P SMA {sma_period}",
+                line=dict(color="crimson", width=2, dash="dot"),
+            ), row=row, col=1,
+        )
+        fig.update_yaxes(title_text="Ratio", row=row, col=1)
 
-# --- Subplot 3: Aktienindex (optional) ---
-if has_index:
-    fig.add_trace(
-        go.Scatter(
-            x=df_index_filtered["DATE"], y=df_index_filtered["CLOSE"],
-            name=f"{selected_index_name} (Close)",
-            line=dict(color="black", width=1.5),
-        ), row=3, col=1,
-    )
-    fig.add_trace(
-        go.Scatter(
-            x=df_index_filtered["DATE"], y=df_index_filtered["INDEX_SMA"],
-            name=f"{selected_index_name} SMA {sma_period}",
-            line=dict(color="orange", width=2),
-        ), row=3, col=1,
-    )
+    elif panel == "index":
+        fig.add_trace(
+            go.Scatter(
+                x=df_index_filtered["DATE"], y=df_index_filtered["CLOSE"],
+                name=f"{selected_index_name} (Close)",
+                line=dict(color="black", width=1.5),
+            ), row=row, col=1,
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=df_index_filtered["DATE"], y=df_index_filtered["INDEX_SMA"],
+                name=f"{selected_index_name} SMA {sma_period}",
+                line=dict(color="orange", width=2),
+            ), row=row, col=1,
+        )
+        fig.update_yaxes(title_text="Index-Stand", row=row, col=1)
+
+    row += 1
 
 fig.update_layout(
-    height=350 * n_rows,
+    height=320 * n_rows,
     template="plotly_white",
     hovermode="x unified",
     legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
 )
-fig.update_yaxes(title_text="Spread Index", row=1, col=1)
-fig.update_yaxes(title_text="Ratio", row=2, col=1)
-if has_index:
-    fig.update_yaxes(title_text="Index-Stand", row=3, col=1)
 
 st.plotly_chart(fig, use_container_width=True)
 
