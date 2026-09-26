@@ -39,15 +39,22 @@ if st.sidebar.button("🔄 Live-Daten neu laden"):
     st.rerun()
 
 st.sidebar.divider()
-st.sidebar.subheader("🔑 Equibles API-Key")
-api_key = st.sidebar.text_input(
-    "API-Key (beginnt mit 'eq_')",
-    type="password",
-    help=(
-        "Kostenlos erhältlich unter https://equibles.com – "
-        "Registrierung dauert unter einer Minute."
-    ),
-)
+
+# API-Key bevorzugt aus Secrets lesen, sonst manuell abfragen
+api_key = st.secrets.get("EQUIBLES_API_KEY", "")
+
+if not api_key:
+    st.sidebar.subheader("🔑 Equibles API-Key")
+    api_key = st.sidebar.text_input(
+        "API-Key (beginnt mit 'eq_')",
+        type="password",
+        help=(
+            "Kostenlos erhältlich unter https://equibles.com – "
+            "Registrierung dauert unter einer Minute."
+        ),
+    )
+else:
+    st.sidebar.success("✅ API-Key aus Secrets geladen")
 
 st.sidebar.divider()
 st.sidebar.subheader("🆘 Fallback-Datenquelle")
@@ -105,7 +112,8 @@ def _fetch_equibles_series(series_type: str, api_key: str, limit: int = 500) -> 
         raise RuntimeError(f"Equibles-API lieferte keine Daten für '{series_type}'.")
 
     df = pd.DataFrame(all_rows)
-    df = df.rename(columns={"putCallRatio": "RATIO"})
+    # WICHTIG: Die API liefert camelCase -> 'date' und 'putCallRatio'
+    df = df.rename(columns={"date": "DATE", "putCallRatio": "RATIO"})
     df["DATE"] = pd.to_datetime(df["DATE"])
     df["RATIO"] = pd.to_numeric(df["RATIO"], errors="coerce")
     return df[["DATE", "RATIO"]].dropna().sort_values("DATE")
