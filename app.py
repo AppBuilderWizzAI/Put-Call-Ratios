@@ -6,12 +6,6 @@ from plotly.subplots import make_subplots
 import requests
 import streamlit as st
 
-try:
-    import yfinance as yf
-    YFINANCE_AVAILABLE = True
-except ImportError:
-    YFINANCE_AVAILABLE = False
-
 # --- SEITEN-KONFIGURATION ---
 st.set_page_config(
     page_title="Smart & Dumb Money Put/Call Ratio", page_icon="📈", layout="wide"
@@ -27,11 +21,10 @@ mit der Spekulation von Kleinanlegern (**Dumb Money** im Einzelaktien-Markt).
 * **Dumb Money:** CBOE Equity Call/Put Ratio ($1 / \\text{EQUITY\\_PC}$)
 * **Spread / Indikator:** $\\text{Index P/C} - \\left(\\frac{1}{\\text{Equity P/C}}\\right)$
 
-ℹ️ *Hinweis:* FRED führt in seiner "CBOE Market Statistics"-Reihe nur Volatilitätsindizes (VIX & Co.),
-**keine** Put/Call-Ratios – das ist also keine Alternative. Cboe selbst veröffentlicht die Ratios frei nur
-als Tageswert, nicht als historische Zeitreihe. Dieses Dashboard nutzt daher weiterhin die inoffiziellen
-Yahoo-Finance-Ticker `^CPCI` / `^CPCE`, jetzt über die robustere `yfinance`-Bibliothek mit
-Wiederholungsversuchen und einem CSV-Fallback für den Fall, dass Yahoo den Zugriff verweigert.
+ℹ️ **Datenquelle:** Die historischen CBOE Put/Call-Ratios werden über die
+[Equibles-API](https://equibles.com/docs/api/endpoints/sentiment) bezogen.
+Die kostenlose Stufe erlaubt 100 Requests/Tag – für dieses Dashboard mehr als ausreichend.
+Ein API-Key ist nach kurzer Registrierung sofort verfügbar.
 """)
 
 # --- SIDEBAR EINSTELLUNGEN ---
@@ -46,13 +39,23 @@ if st.sidebar.button("🔄 Live-Daten neu laden"):
     st.rerun()
 
 st.sidebar.divider()
+st.sidebar.subheader("🔑 Equibles API-Key")
+api_key = st.sidebar.text_input(
+    "API-Key (beginnt mit 'eq_')",
+    type="password",
+    help=(
+        "Kostenlos erhältlich unter https://equibles.com – "
+        "Registrierung dauert unter einer Minute."
+    ),
+)
+
+st.sidebar.divider()
 st.sidebar.subheader("🆘 Fallback-Datenquelle")
 use_csv_fallback = st.sidebar.toggle(
     "Eigene CSV statt Live-Abruf verwenden",
     help=(
-        "Falls der Live-Abruf von Yahoo Finance blockiert wird (z.B. auf Streamlit "
-        "Community Cloud), kannst du hier eine eigene CSV mit den Spalten "
-        "DATE, INDEX_PC, EQUITY_PC hochladen."
+        "Falls der Live-Abruf blockiert wird oder kein API-Key vorliegt, "
+        "kannst du hier eine eigene CSV mit den Spalten DATE, INDEX_PC, EQUITY_PC hochladen."
     ),
 )
 uploaded_csv = None
@@ -62,84 +65,62 @@ if use_csv_fallback:
     )
 
 
-# --- METHODE 1: DATEN ÜBER yfinance (empfohlen) ---
-def _fetch_via_yfinance(ticker: str, period: str = "5y") -> pd.DataFrame:
-    hist = yf.Ticker(ticker).history(period=period, interval="1d", auto_adjust=False)
-    if hist is None or hist.empty:
-        raise RuntimeError("yfinance lieferte einen leeren Datensatz zurück.")
-    out = hist[["Close"]].reset_index()
-    out.rename(columns={out.columns[0]: "DATE", "Close": ticker}, inplace=True)
-    out["DATE"] = pd.to_datetime(out["DATE"]).dt.tz_localize(None)
-    return out.dropna()
+# --- EQUIBLES API ---
+EQUIBLES_BASE = "https://api.equibles.com/v1/market/put-call-ratios"
 
 
-# --- METHODE 2: DIREKTER AUFRUF DER INOFFIZIELLEN CHART-API (Fallback) ---
-def _fetch_via_raw_api(ticker: str, range_str: str = "5y") -> pd.DataFrame:
-    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?range={range_str}&interval=1d"
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-            " (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-        ),
-        "Accept": "application/json",
-    }
-    response = requests.get(url, headers=headers, timeout=15)
-    if response.status_code != 200:
-        raise RuntimeError(
-            f"HTTP {response.status_code} beim Abrufen von {ticker}. "
-            f"Antwort (Auszug): {response.text[:200]!r}"
-        )
-    data = response.json()
-    chart = data.get("chart", {})
-    if chart.get("error"):
-        raise RuntimeError(f"Yahoo-API-Fehler für {ticker}: {chart['error']}")
-    results = chart.get("result")
-    if not results:
-        raise RuntimeError(f"Keine Ergebnisse für {ticker} (Symbol evtl. nicht mehr verfügbar).")
-    result = results[0]
-    timestamps = result.get("timestamp")
-    quote = result.get("indicators", {}).get("quote", [{}])
-    closes = quote[0].get("close") if quote else None
-    if not timestamps or not closes:
-        raise RuntimeError(f"Unvollständige Daten für {ticker} in der API-Antwort.")
-    df = pd.DataFrame({
-        "DATE": pd.to_datetime(timestamps, unit="s").normalize(),
-        ticker: closes,
-    })
-    return df.dropna()
+def _fetch_equibles_series(series_type: str, api_key: str, limit: int = 500) -> pd.DataFrame:
+    """Holt eine Put/Call-Ratio-Zeitreihe von der Equibles-API.
 
-
-def fetch_yahoo_data(ticker: str, max_retries: int = 3) -> pd.DataFrame:
-    """Holt historische Daten zu einem Ticker robust über zwei Methoden mit Retries.
-
-    Wichtig: Fehler werden NICHT verschluckt, sondern gesammelt und am Ende
-    komplett zurückgegeben, damit man in der App sieht, woran es wirklich lag
-    (Netzwerk, Rate-Limit, ungültiges Symbol, ...) statt nur "irgendein Fehler".
+    series_type: 'Index' oder 'Equity' (auch 'Total', 'Vix', 'Etp' möglich).
     """
-    errors = []
+    headers = {"Authorization": f"Bearer {api_key}"}
+    all_rows = []
+    offset = 0
 
-    if YFINANCE_AVAILABLE:
-        for attempt in range(1, max_retries + 1):
-            try:
-                return _fetch_via_yfinance(ticker)
-            except Exception as e:
-                errors.append(f"[yfinance, Versuch {attempt}/{max_retries}] {e}")
-                if attempt < max_retries:
-                    time.sleep(1.5 * attempt)
-    else:
-        errors.append("[yfinance] Bibliothek nicht installiert (siehe requirements.txt).")
+    while True:
+        params = {
+            "type": series_type,
+            "limit": limit,
+            "offset": offset,
+        }
+        resp = requests.get(EQUIBLES_BASE, headers=headers, params=params, timeout=20)
+        if resp.status_code == 401:
+            raise RuntimeError("Equibles-API-Key ungültig oder abgelaufen.")
+        if resp.status_code == 429:
+            raise RuntimeError("Equibles-API-Rate-Limit erreicht (100 Requests/Tag).")
+        resp.raise_for_status()
 
-    for attempt in range(1, max_retries + 1):
-        try:
-            return _fetch_via_raw_api(ticker)
-        except Exception as e:
-            errors.append(f"[Raw-API, Versuch {attempt}/{max_retries}] {e}")
-            if attempt < max_retries:
-                time.sleep(1.5 * attempt)
+        payload = resp.json()
+        rows = payload.get("data", [])
+        if not rows:
+            break
+        all_rows.extend(rows)
+        if not payload.get("meta", {}).get("hasMore", False):
+            break
+        offset += limit
+        time.sleep(0.2)  # sanfte Drosselung
 
-    raise RuntimeError(
-        f"Alle Abrufversuche für '{ticker}' sind fehlgeschlagen:\n- " + "\n- ".join(errors)
-    )
+    if not all_rows:
+        raise RuntimeError(f"Equibles-API lieferte keine Daten für '{series_type}'.")
+
+    df = pd.DataFrame(all_rows)
+    df = df.rename(columns={"putCallRatio": "RATIO"})
+    df["DATE"] = pd.to_datetime(df["DATE"])
+    df["RATIO"] = pd.to_numeric(df["RATIO"], errors="coerce")
+    return df[["DATE", "RATIO"]].dropna().sort_values("DATE")
+
+
+def fetch_equibles_data(api_key: str) -> pd.DataFrame:
+    """Lädt Index- und Equity-Put/Call-Ratio und führt sie zu einem DataFrame zusammen."""
+    df_index = _fetch_equibles_series("Index", api_key)
+    df_equity = _fetch_equibles_series("Equity", api_key)
+
+    df_index = df_index.rename(columns={"RATIO": "INDEX_PC"})
+    df_equity = df_equity.rename(columns={"RATIO": "EQUITY_PC"})
+
+    df = pd.merge(df_index, df_equity, on="DATE", how="inner")
+    return _add_derived_columns(df)
 
 
 def _add_derived_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -155,12 +136,8 @@ def _add_derived_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def load_live_data() -> pd.DataFrame:
-    df_cpci = fetch_yahoo_data("^CPCI")
-    df_cpce = fetch_yahoo_data("^CPCE")
-    df = pd.merge(df_cpci, df_cpce, on="DATE")
-    df.rename(columns={"^CPCI": "INDEX_PC", "^CPCE": "EQUITY_PC"}, inplace=True)
-    return _add_derived_columns(df)
+def load_live_data(api_key: str) -> pd.DataFrame:
+    return fetch_equibles_data(api_key)
 
 
 def load_csv_data(uploaded_file) -> pd.DataFrame:
@@ -219,9 +196,16 @@ if use_csv_fallback:
         st.info("⬅️ Bitte in der Seitenleiste eine CSV-Datei hochladen.")
         st.stop()
 else:
+    if not api_key:
+        st.info(
+            "⬅️ Bitte in der Seitenleiste einen Equibles-API-Key eingeben. "
+            "Kostenlos erhältlich unter https://equibles.com"
+        )
+        st.stop()
+
     try:
-        with st.spinner("Lade neuste Marktdaten von Yahoo Finance..."):
-            df = load_live_data()
+        with st.spinner("Lade neuste Put/Call-Ratio-Daten von Equibles..."):
+            df = load_live_data(api_key)
     except Exception as e:
         load_error = e
 
@@ -230,14 +214,13 @@ if load_error is not None:
     with st.expander("🔍 Technische Details zum Fehler", expanded=True):
         st.code(str(load_error))
     st.warning(
-        "**Häufigste Ursache:** Yahoo Finance blockiert Anfragen von geteilten Cloud-IPs "
-        "(z. B. Streamlit Community Cloud) – unabhängig vom User-Agent-Header. "
-        "FRED ist hier übrigens **keine** Alternative (führt keine Put/Call-Ratios), "
-        "und Cboe selbst gibt frei nur den heutigen Tageswert heraus.\n\n"
+        "**Häufigste Ursachen:**\n"
+        "- Der Equibles-API-Key fehlt oder ist ungültig (beginnt mit `eq_`).\n"
+        "- Das tägliche Rate-Limit von 100 Requests ist erreicht.\n\n"
         "**Optionen:**\n"
-        "- Auf **'🔄 Live-Daten neu laden'** klicken und es in ein paar Minuten erneut versuchen.\n"
-        "- Links auf **'Eigene CSV statt Live-Abruf verwenden'** umschalten.\n"
-        "- Lokal (nicht auf Streamlit Cloud) testen, ob es dort ebenfalls fehlschlägt."
+        "- API-Key unter https://equibles.com prüfen oder neu erstellen.\n"
+        "- Auf **'🔄 Live-Daten neu laden'** klicken und es später erneut versuchen.\n"
+        "- Links auf **'Eigene CSV statt Live-Abruf verwenden'** umschalten."
     )
     st.stop()
 
@@ -314,7 +297,7 @@ st.divider()
 with st.expander("🔎 Live-Abgleich mit der offiziellen Cboe-Quelle (heutiger Wert)"):
     st.caption(
         "Cboe veröffentlicht frei nur den aktuellen Tageswert, keine historische Zeitreihe – "
-        "dient hier nur als Plausibilitätscheck für die Yahoo-Daten oben."
+        "dient hier nur als Plausibilitätscheck für die Equibles-Daten oben."
     )
     try:
         snap = fetch_cboe_snapshot()
