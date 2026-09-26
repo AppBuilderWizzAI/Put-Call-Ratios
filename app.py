@@ -1,3 +1,5 @@
+import os
+import pickle
 import time
 from datetime import datetime, timedelta
 
@@ -27,7 +29,17 @@ mit der Spekulation von Kleinanlegern (**Dumb Money** im Einzelaktien-Markt).
 * **Smart Money:** CBOE Index Put/Call Ratio (`INDEX_PC`)
 * **Dumb Money:** CBOE Equity Put/Call Ratio (`EQUITY_PC`)
 * **Spread / Indikator:** $\\text{Index P/C} - \\text{Equity P/C}$
+
+ℹ️ **Datenquelle:** Die historischen CBOE Put/Call-Ratios werden über die
+[Equibles-API](https://equibles.com/docs/api/endpoints/sentiment) bezogen.
+Die Daten werden 24 Stunden lokal gecacht, um das Rate-Limit von 100 Requests/Tag zu schonen.
 """)
+
+# --- CACHE-KONSTANTEN ---
+CACHE_FILE = "cboe_data_cache.pkl"
+CACHE_TTL_HOURS = 24
+# Immer 10 Jahre anfordern – der Slider schneidet dann lokal zu
+MAX_FETCH_DAYS = 3650
 
 # --- SIDEBAR EINSTELLUNGEN ---
 st.sidebar.header("⚙️ Einstellungen")
@@ -62,7 +74,13 @@ selected_index_name = st.sidebar.selectbox(
 )
 selected_index_ticker = INDEX_OPTIONS[selected_index_name]
 
-if st.sidebar.button("🔄 Live-Daten neu laden"):
+if st.sidebar.button("🔄 Cache leeren & neu laden"):
+    # Datei-Cache UND In-Memory-Cache leeren
+    if os.path.exists(CACHE_FILE):
+        try:
+            os.remove(CACHE_FILE)
+        except Exception:
+            pass
     st.cache_data.clear()
     st.rerun()
 
@@ -106,7 +124,7 @@ def _fetch_equibles_series(
         if resp.status_code == 401:
             raise RuntimeError("Equibles-API-Key ungültig oder abgelaufen.")
         if resp.status_code == 429:
-            raise RuntimeError("Equibles-API-Rate-Limit erreicht (100 Requests/Tag).")
+            raise RuntimeError("RATE_LIMIT")  # wird oben abgefangen
         resp.raise_for_status()
 
         payload = resp.json()
@@ -115,7 +133,6 @@ def _fetch_equibles_series(
             break
         all_rows.extend(rows)
 
-        # Abbruchbedingungen: kürzere Seite ODER explizit hasMore=False
         if len(rows) < page_limit:
             break
         if not payload.get("meta", {}).get("hasMore", True):
@@ -134,11 +151,10 @@ def _fetch_equibles_series(
     return df[["DATE", "RATIO"]].dropna().sort_values("DATE").reset_index(drop=True)
 
 
-def fetch_equibles_data(api_key: str, days: int) -> pd.DataFrame:
-    """Lädt Index- und Equity-Put/Call-Ratio für den gewünschten Zeitraum."""
+def fetch_equibles_data(api_key: str) -> pd.DataFrame:
+    """Lädt immer die volle 10-Jahres-Historie von Index- und Equity-P/C."""
     end_dt = datetime.now()
-    # Puffer für SMA-Berechnung, damit die ersten Werte nicht NaN sind
-    start_dt = end_dt - timedelta(days=days + sma_period * 3)
+    start_dt = end_dt - timedelta(days=MAX_FETCH_DAYS + 300)  # Puffer für SMA
 
     start_date = start_dt.strftime("%Y-%m-%d")
     end_date = end_dt.strftime("%Y-%m-%d")
@@ -152,6 +168,32 @@ def fetch_equibles_data(api_key: str, days: int) -> pd.DataFrame:
     return pd.merge(df_index, df_equity, on="DATE", how="inner")
 
 
+# --- DATEI-CACHE ---
+def _load_cache_from_disk() -> pd.DataFrame | None:
+    """Lädt die gecachten Rohdaten (ohne SMA) von der Festplatte."""
+    if not os.path.exists(CACHE_FILE):
+        return None
+    try:
+        with open(CACHE_FILE, "rb") as f:
+            payload = pickle.load(f)
+        df = payload["df"]
+        timestamp = payload["timestamp"]
+        age_hours = (datetime.now() - timestamp).total_seconds() / 3600
+        df.attrs["cache_age_hours"] = age_hours
+        return df
+    except Exception:
+        return None
+
+
+def _save_cache_to_disk(df: pd.DataFrame) -> None:
+    """Speichert die Rohdaten (ohne SMA) mit Zeitstempel."""
+    try:
+        with open(CACHE_FILE, "wb") as f:
+            pickle.dump({"df": df, "timestamp": datetime.now()}, f)
+    except Exception:
+        pass  # Cache-Fehler sind nicht kritisch
+
+
 # --- AKTIENINDEX VIA YFINANCE ---
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_index_data(ticker: str, days: int) -> pd.DataFrame:
@@ -160,7 +202,6 @@ def fetch_index_data(ticker: str, days: int) -> pd.DataFrame:
         raise RuntimeError("yfinance ist nicht installiert.")
 
     end_dt = datetime.now()
-    # Etwas mehr Vorlauf, damit SMA auch am Anfang berechnet werden kann
     start_dt = end_dt - timedelta(days=days + 200)
 
     hist = yf.Ticker(ticker).history(
@@ -180,25 +221,45 @@ def fetch_index_data(ticker: str, days: int) -> pd.DataFrame:
 
 # --- HILFSFUNKTIONEN ---
 def _add_derived_columns(df: pd.DataFrame, sma_period: int) -> pd.DataFrame:
-    """Berechnet abgeleitete Spalten. Spread = INDEX_PC - EQUITY_PC."""
+    """Berechnet Spread und SMAs. Spread = INDEX_PC - EQUITY_PC."""
+    df = df.copy()
     df["DATE"] = pd.to_datetime(df["DATE"])
     df["INDEX_PC"] = pd.to_numeric(df["INDEX_PC"], errors="coerce")
     df["EQUITY_PC"] = pd.to_numeric(df["EQUITY_PC"], errors="coerce")
     df = df.dropna().sort_values("DATE").reset_index(drop=True)
 
-    # KORRIGIERT: Spread ist die einfache Differenz der beiden Put/Call-Ratios
     df["SPREAD"] = df["INDEX_PC"] - df["EQUITY_PC"]
-
     df["SPREAD_SMA"] = df["SPREAD"].rolling(window=sma_period).mean()
     df["INDEX_PC_SMA"] = df["INDEX_PC"].rolling(window=sma_period).mean()
     df["EQUITY_PC_SMA"] = df["EQUITY_PC"].rolling(window=sma_period).mean()
     return df
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def load_live_data(api_key: str, days: int, sma_period: int) -> pd.DataFrame:
-    df = fetch_equibles_data(api_key, days)
-    return _add_derived_columns(df, sma_period)
+def _fetch_or_load_raw_data(api_key: str) -> tuple[pd.DataFrame, str]:
+    """Liefert (Rohdaten, Status) – Status ist 'cache' oder 'api' oder 'stale_cache'."""
+    cached = _load_cache_from_disk()
+    if cached is not None:
+        age = cached.attrs.get("cache_age_hours", 999)
+        if age <= CACHE_TTL_HOURS:
+            return cached, "cache"
+
+    # Cache fehlt oder ist abgelaufen → API fragen
+    try:
+        fresh = fetch_equibles_data(api_key)
+        _save_cache_to_disk(fresh)
+        return fresh, "api"
+    except RuntimeError as e:
+        if str(e) == "RATE_LIMIT" and cached is not None:
+            # Rate-Limit erreicht, aber abgelaufener Cache vorhanden → den nutzen
+            return cached, "stale_cache"
+        raise
+
+
+@st.cache_data(ttl=CACHE_TTL_HOURS * 3600, show_spinner=False)
+def load_data(api_key: str, sma_period: int) -> tuple[pd.DataFrame, str]:
+    """In-Memory-Cache (pro Session). Lädt Rohdaten und berechnet SMAs."""
+    raw, status = _fetch_or_load_raw_data(api_key)
+    return _add_derived_columns(raw, sma_period), status
 
 
 # --- OPTIONALER LIVE-CHECK GEGEN DIE OFFIZIELLE CBOE-QUELLE ---
@@ -238,6 +299,7 @@ def fetch_cboe_snapshot() -> dict:
 df = None
 df_index = None
 load_error = None
+data_status = None
 
 if not api_key:
     st.info(
@@ -247,8 +309,8 @@ if not api_key:
     st.stop()
 
 try:
-    with st.spinner("Lade Put/Call-Ratio-Daten von Equibles..."):
-        df = load_live_data(api_key, days, sma_period)
+    with st.spinner("Lade Put/Call-Ratio-Daten..."):
+        df, data_status = load_data(api_key, sma_period)
 except Exception as e:
     load_error = e
 
@@ -263,14 +325,27 @@ if load_error is not None:
     st.error("❌ Der automatische Live-Abruf ist fehlgeschlagen.")
     with st.expander("🔍 Technische Details zum Fehler", expanded=True):
         st.code(str(load_error))
+    st.info(
+        "**Hinweis:** Wenn das Rate-Limit erreicht ist, wird beim nächsten Aufruf "
+        "automatisch der letzte Cache-Stand verwendet, sofern vorhanden. "
+        "Der Cache wird alle 24 Stunden aktualisiert."
+    )
     st.stop()
 
+# --- STATUS-HINWEIS ---
+if data_status == "cache":
+    st.success("✅ Daten aus lokalem Cache (max. 24 h alt) – kein API-Request nötig.")
+elif data_status == "api":
+    st.info("🔄 Daten frisch von der Equibles-API geladen und für 24 h gecacht.")
+elif data_status == "stale_cache":
+    st.warning(
+        "⚠️ Rate-Limit erreicht – zeige Daten aus dem letzten Cache-Stand. "
+        "Der Cache wird automatisch erneuert, sobald das Limit zurückgesetzt ist."
+    )
+
 # --- DATEN FILTERN ---
-# P/C-Daten: letzte `days` Zeilen
 df_filtered = df.tail(days).copy()
 
-# Index-Daten: unabhängig vom P/C-Zeitraum ebenfalls letzte `days` Zeilen
-# (so funktioniert 10-Jahres-Ansicht auch, wenn P/C nur kürzer verfügbar ist)
 if df_index is not None and not df_index.empty:
     df_index_filtered = df_index.tail(days).copy()
     df_index_filtered["INDEX_SMA"] = (
@@ -305,7 +380,7 @@ n_rows = len(active_panels)
 panel_titles = {
     "spread": "Smart vs. Dumb Money Spread Index",
     "components": "Einzelkomponenten (Index P/C vs. Equity P/C)",
-    "index": f"{selected_index_name} (Schlusskurs + SMA {sma_period})",
+    "index": f"{selected_index_name} (Tageskurs + SMA {sma_period})",
 }
 
 fig = make_subplots(
@@ -367,7 +442,6 @@ for panel in active_panels:
         fig.update_yaxes(title_text="Ratio", row=row, col=1)
 
     elif panel == "index":
-        # Tageskurs: kräftige, auf hell UND dunkel sichtbare Farbe
         fig.add_trace(
             go.Scatter(
                 x=df_index_filtered["DATE"], y=df_index_filtered["CLOSE"],
@@ -376,7 +450,6 @@ for panel in active_panels:
                 hovertemplate="%{y:,.0f}<extra></extra>",
             ), row=row, col=1,
         )
-        # Gleitender Durchschnitt darüber
         fig.add_trace(
             go.Scatter(
                 x=df_index_filtered["DATE"], y=df_index_filtered["INDEX_SMA"],
